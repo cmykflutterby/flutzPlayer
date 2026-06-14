@@ -1,0 +1,221 @@
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+$VendorRoot = Join-Path $RepoRoot "vendor"
+$Sdl3Root = Join-Path $VendorRoot "SDL3"
+$JemallocRoot = Join-Path $VendorRoot "tikv-jemalloc-sys"
+$Sdl3SysVersion = "0.6.2+SDL-3.4.4"
+$JemallocVersion = "0.6.1"
+$Sdl3SysPackageName = "sdl3-sys-$Sdl3SysVersion"
+$Sdl3SysDestination = Join-Path $Sdl3Root "sdl3-sys-0.6.2+SDL-3.4.4-spacefix"
+$JemallocPackageName = "tikv-jemalloc-sys-$JemallocVersion"
+
+function Ensure-Directory {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    New-Item -ItemType Directory -Force -Path $Path | Out-Null
+}
+
+function Resolve-CargoExecutable {
+    $cargoCommand = Get-Command cargo -CommandType Application -ErrorAction SilentlyContinue
+    if ($null -eq $cargoCommand) {
+        throw 'Could not locate cargo in the active environment.'
+    }
+
+    return $cargoCommand.Source
+}
+
+function Remove-PathIfPresent {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    if (Test-Path -LiteralPath $Path) {
+        Remove-Item -Recurse -Force -LiteralPath $Path
+    }
+}
+
+function Get-RegistrySourceRoot {
+    $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE ".cargo" }
+    $registrySrcRoot = Join-Path $cargoHome "registry/src"
+    if (-not (Test-Path -LiteralPath $registrySrcRoot)) {
+        throw "Cargo registry source cache not found: $registrySrcRoot"
+    }
+
+    return $registrySrcRoot
+}
+
+function Ensure-CrateSourcesFetched {
+    $fetchRoot = Join-Path ([System.IO.Path]::GetTempPath()) "flutz-gh-vendor-fetch"
+    Remove-PathIfPresent -Path $fetchRoot
+    Ensure-Directory -Path $fetchRoot
+    Ensure-Directory -Path (Join-Path $fetchRoot "src")
+
+    $manifestPath = Join-Path $fetchRoot "Cargo.toml"
+    $mainPath = Join-Path $fetchRoot "src/main.rs"
+    Set-Content -LiteralPath $manifestPath -Value @"
+[package]
+name = "flutz_gh_vendor_fetch"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+sdl3-sys = "=$Sdl3SysVersion"
+tikv-jemalloc-sys = "=$JemallocVersion"
+"@
+    Set-Content -LiteralPath $mainPath -Value "fn main() {}"
+
+    $cargoExe = Resolve-CargoExecutable
+    & $cargoExe fetch --manifest-path $manifestPath
+    if ($LASTEXITCODE -ne 0) {
+        throw "$cargoExe fetch failed with exit code $LASTEXITCODE"
+    }
+
+    Remove-PathIfPresent -Path $fetchRoot
+}
+
+function Patch-JemallocBuildScript {
+    param([Parameter(Mandatory = $true)][string]$SourceRoot)
+
+    $buildScriptPath = Join-Path $SourceRoot "build.rs"
+    if (-not (Test-Path -LiteralPath $buildScriptPath)) {
+        return
+    }
+
+    $buildScript = [System.IO.File]::ReadAllText($buildScriptPath)
+
+    $buildScript = [regex]::Replace(
+        $buildScript,
+        'let mut cmd = Command::new\("sh"\);',
+@'
+    let shell = if let Some(shell) = read_and_watch_env_os("CONFIG_SHELL") {
+        PathBuf::from(shell)
+    } else if target.contains("windows") {
+        let candidate_paths = [
+            r"C:\msys64\usr\bin\sh.exe",
+            r"C:\msys64\usr\bin\bash.exe",
+            r"C:\Program Files\Git\bin\sh.exe",
+            r"C:\Program Files\Git\bin\bash.exe",
+            r"C:\Program Files\Git\usr\bin\sh.exe",
+            r"C:\Program Files\Git\usr\bin\bash.exe",
+            r"C:\Program Files (x86)\Git\bin\sh.exe",
+            r"C:\Program Files (x86)\Git\bin\bash.exe",
+            r"C:\Program Files (x86)\Git\usr\bin\sh.exe",
+            r"C:\Program Files (x86)\Git\usr\bin\bash.exe",
+        ];
+
+        candidate_paths
+            .iter()
+            .map(PathBuf::from)
+            .find(|candidate| candidate.exists())
+            .unwrap_or_else(|| PathBuf::from("sh"))
+    } else {
+        PathBuf::from("sh")
+    };
+    let shell_dir = shell.parent().map(PathBuf::from);
+    if let Some(shell_dir) = shell_dir {
+        let mut path = OsString::from(shell_dir);
+        if let Some(existing_path) = env::var_os("PATH") {
+            path.push(";");
+            path.push(existing_path);
+        }
+        env::set_var("PATH", &path);
+        env::set_var("SHELL", &shell);
+        env::set_var("MAKESHELL", &shell);
+    }
+    let mut cmd = Command::new(shell);
+'@
+    )
+
+    $buildScript = [regex]::Replace(
+        $buildScript,
+        '(?s)// Make install:\s*run\(make_command\(make, &build_dir, &num_jobs\)\s*\.arg\("install_lib_static"\)\s*\.arg\("install_include"\)\);\s*\s*println!\("cargo:root=\{\}", out_dir\.display\(\)\);',
+@'
+    // Make install:
+    run(make_command(make, &build_dir, &num_jobs)
+        .arg("install_lib_static")
+        .arg("install_include"));
+
+    if target.contains("windows") {
+        let windows_static_lib = build_dir.join("lib").join("jemalloc.lib");
+        let expected_static_lib = build_dir.join("lib").join("libjemalloc.a");
+        if windows_static_lib.exists() && !expected_static_lib.exists() {
+            fs::copy(&windows_static_lib, &expected_static_lib)
+                .expect("failed to copy jemalloc static library for GNU linking");
+        }
+    }
+
+    println!("cargo:root={}", out_dir.display());
+'@
+    )
+
+    if ($buildScript -notmatch 'libjemalloc\.a') {
+        throw 'Failed to patch tikv-jemalloc-sys build.rs for GNU static-library linking.'
+    }
+
+    [System.IO.File]::WriteAllText($buildScriptPath, $buildScript)
+}
+
+function Copy-CrateSource {
+    param(
+        [Parameter(Mandatory = $true)][string]$CrateName,
+        [Parameter(Mandatory = $true)][string]$Version,
+        [Parameter(Mandatory = $true)][string]$DestinationPath
+    )
+
+    $destinationManifest = Join-Path $DestinationPath "Cargo.toml"
+    if (Test-Path -LiteralPath $destinationManifest) {
+        if ($CrateName -eq 'tikv-jemalloc-sys') {
+            Patch-JemallocBuildScript -SourceRoot $DestinationPath
+        }
+
+        return
+    }
+
+    if (Test-Path -LiteralPath $DestinationPath) {
+        Remove-PathIfPresent -Path $DestinationPath
+    }
+
+    Ensure-CrateSourcesFetched
+
+    $packageName = "$CrateName-$Version"
+    $registryRoot = Get-RegistrySourceRoot
+    $packageRoot = Get-ChildItem -LiteralPath $registryRoot -Recurse -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -like "$packageName*" } |
+        Select-Object -First 1
+
+    if ($null -eq $packageRoot) {
+        throw "Could not locate $packageName in the Cargo registry source cache under $registryRoot"
+    }
+
+    Ensure-Directory -Path (Split-Path -Parent $DestinationPath)
+    Copy-Item -Recurse -Force -LiteralPath $packageRoot.FullName -Destination $DestinationPath
+
+    if ($CrateName -eq 'tikv-jemalloc-sys') {
+        Patch-JemallocBuildScript -SourceRoot $DestinationPath
+    }
+}
+
+if ((Test-Path -LiteralPath (Join-Path $Sdl3SysDestination "Cargo.toml")) -and (Test-Path -LiteralPath (Join-Path $JemallocRoot "Cargo.toml"))) {
+    Write-Host "Using existing vendored SDL3 source: $Sdl3SysDestination"
+    exit 0
+}
+
+Ensure-Directory -Path $VendorRoot
+Ensure-Directory -Path $Sdl3Root
+Ensure-Directory -Path $JemallocRoot
+
+Copy-CrateSource -CrateName 'sdl3-sys' -Version $Sdl3SysVersion -DestinationPath $Sdl3SysDestination
+Copy-CrateSource -CrateName 'tikv-jemalloc-sys' -Version $JemallocVersion -DestinationPath $JemallocRoot
+
+foreach ($requiredPath in @(
+    (Join-Path $Sdl3SysDestination 'Cargo.toml'),
+    (Join-Path $JemallocRoot 'Cargo.toml'),
+    (Join-Path $JemallocRoot 'build.rs')
+)) {
+    if (-not (Test-Path -LiteralPath $requiredPath)) {
+        throw "Vendoring step did not produce expected path: $requiredPath"
+    }
+}
+
+Write-Host "Vendored SDL3 source ready at $Sdl3SysDestination"
+Write-Host "Vendored jemalloc source ready at $JemallocRoot"
