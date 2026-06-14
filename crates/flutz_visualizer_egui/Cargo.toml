@@ -1,0 +1,12 @@
+[package]
+name = "flutz_visualizer_egui"
+version = "0.1.0"
+edition.workspace = true
+description = "egui renderer adapter for flutzPlayer spectrum visualizer frames."
+
+[dependencies]
+flutz_visualizer_core = { path = "../flutz_visualizer_core" }
+egui = "0.33.3"
+
+[lints]
+workspace = true

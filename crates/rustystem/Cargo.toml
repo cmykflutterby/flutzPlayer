@@ -1,0 +1,30 @@
+[package]
+name = "rustystem"
+version = "0.1.0"
+authors = ["Nobuaki Tanaka"]
+edition.workspace = true
+description = "RustySynth-derived SoundFont MIDI stem renderer for flutzPlayer"
+readme = "README.md"
+keywords = [
+    "soundfont",
+    "midi",
+    "synthesizer",
+    "audio",
+    "music",
+]
+categories = ["multimedia::audio"]
+license = "MIT"
+
+[lib]
+name = "rustystem"
+path = "src/lib.rs"
+
+[dependencies]
+
+[dev-dependencies]
+flutz_core = { path = "../flutz_core" }
+flutz_mixer = { path = "../flutz_mixer" }
+flutz_dat = { path = "../flutz_dat" }
+
+[lints]
+workspace = true

@@ -1,0 +1,138 @@
+# Default soundfont ID to use when loading a FMID that doesn't specify overrides
+default_soundfont_id = "hiqual"
+
+# Packing order determines how assets are arranged in the DAT archive.
+# Available options:
+#   - "smallest-first": Assets are sorted by source file size (smallest to largest).
+#                       This is the recommended approach for optimal packing efficiency.
+#   - "manifest-order": Assets are packed in the order they appear in this manifest.
+#
+# If this setting is missing or contains an unrecognized value, "smallest-first" is used.
+packing_order = "smallest-first"
+
+[[assets]]
+internal_id = "8bit"
+display_name = "8-bit"
+asset_type = "soundfont"
+source_format = "sf2"
+runtime_format = "sf2"
+source_path = "soundfonts/8bitsf.SF2"
+include_in_dat = true
+
+[[assets]]
+internal_id = "retro"
+display_name = "Retro"
+asset_type = "soundfont"
+source_format = "sf2"
+runtime_format = "sf2"
+source_path = "soundfonts/Arachno_SoundFont_Version_1.0.sf2"
+include_in_dat = true
+
+[[assets]]
+internal_id = "fluidr3_gm2_2"
+display_name = "General Midi"
+asset_type = "soundfont"
+source_format = "sf2"
+runtime_format = "sf2"
+source_path = "soundfonts/FluidR3_GM2-2.SF2"
+include_in_dat = true
+
+[[assets]]
+internal_id = "roland_sc_55"
+display_name = "Roland"
+asset_type = "soundfont"
+source_format = "sf2"
+runtime_format = "sf2"
+source_path = "soundfonts/Roland_SC-55_v2.2_by_Patch93_and_xan1242.sf2"
+include_in_dat = true
+
+[[assets]]
+internal_id = "opl3"
+display_name = "OPL3"
+asset_type = "soundfont"
+source_format = "sf2"
+runtime_format = "sf2"
+source_path = "soundfonts/OPL-3 FM 128M.sf2"
+include_in_dat = true
+
+[[assets]]
+internal_id = "sbhq"
+display_name = "AWE-64"
+asset_type = "soundfont"
+source_format = "sf2"
+runtime_format = "sf2"
+source_path = "soundfonts/Sound.Blaster.Restoration.Project.sf2"
+include_in_dat = true
+
+[[assets]]
+internal_id = "sonivox_gs250"
+display_name = "GS"
+asset_type = "soundfont"
+source_format = "sf2"
+runtime_format = "sf2"
+source_path = "soundfonts/SONiVOX_GS250.sf2"
+include_in_dat = true
+
+[[assets]]
+internal_id = "snes"
+display_name = "SNES"
+asset_type = "soundfont"
+source_format = "sf2"
+runtime_format = "sf2"
+source_path = "soundfonts/Super_Nintendo_Unofficial_update.sf2"
+include_in_dat = true
+
+[[assets]]
+internal_id = "megadrive"
+display_name = "MegaDrive"
+asset_type = "soundfont"
+source_format = "sf2"
+runtime_format = "sf2"
+source_path = "soundfonts/The_Ultimate Megadrive_Soundfont[v1.5].sf2"
+include_in_dat = true
+
+[[assets]]
+internal_id = "wii"
+display_name = "Wii"
+asset_type = "soundfont"
+source_format = "sf2"
+runtime_format = "sf2"
+source_path = "soundfonts/The_Ultimate_Wii_Soundfont_V1-1.sf2"
+include_in_dat = true
+
+[[assets]]
+internal_id = "hiqual"
+display_name = "GM/GS/XG/SFX"
+asset_type = "soundfont"
+source_format = "sf2"
+runtime_format = "sf2"
+source_path = "soundfonts/Timbres Of Heaven GM_GS_XG_SFX V 3.4 Final.sf2"
+include_in_dat = true
+
+# This font is amazing, but it's 4GB on its own, so... byebye -flt
+#[[assets]]
+#internal_id = "realistic"
+#display_name = "Realistic"
+#asset_type = "soundfont"
+#source_format = "sf2"
+#runtime_format = "sf2"
+#source_path = "soundfonts/HiDef.sf2"
+#include_in_dat = true
+
+[[assets]]
+internal_id = "simple"
+display_name = "Simple GM"
+asset_type = "soundfont"
+source_format = "sf2"
+runtime_format = "sf2"
+source_path = "soundfonts/TimGM6mb.sf2"
+include_in_dat = true
+
+[[assets]]
+internal_id = "yamaha_xg"
+display_name = "XG"
+asset_type = "soundfont"
+source_format = "sf2"
+runtime_format = "sf2"
+source_path = "soundfonts/Yamaha_XG_Sound_Set.sf2"
+include_in_dat = true

@@ -1,0 +1,62 @@
+# Multi-font preset config for build-time ingestion.
+#
+# Ordering rule:
+# - font_ids are listed from oldest -> newest load order.
+# - newer entries have higher precedence for instrument coverage.
+# - earlier entries act as fallback layers.
+#
+# Blend modes:
+# - replace-mute: newest provider renders, older providers are muted for that strip.
+# - blend-even: all provider fonts render, each provider gets equal strip volume share.
+# - blend-weight: all provider fonts render, strip shares follow per-font weights.
+
+default_preset_id = "realistic"
+
+[coverage]
+# Coverage cache policy for v1:
+# - scan each loaded SF2 when first needed
+# - keep parsed coverage metadata in memory for the current app run
+# - do not write coverage cache into FMID
+# - do not require on-disk cache in v1
+mode = "scan_and_cache"
+
+# If true, require a melodic preset match by exact bank+program.
+# If false, future versions may allow compatibility fallback heuristics.
+strict_bank_program_match = true
+
+# If true, channel 10 percussion uses bank 128 coverage checks.
+percussion_requires_bank_128 = true
+
+[[presets]]
+id = "retro"
+display_name = "Retro Synths"
+description = "Retro 8/16-bit Hardware Blend"
+font_ids = ["roland_sc_55","megadrive","snes","8bit"]
+blend_mode = "blend-even"
+
+[[presets]]
+id = "pc"
+display_name = "PC Blend"
+description = "Console-focused stack with SC-55 top priority"
+font_ids = ["roland_sc_55","opl3","sbhq"]
+blend_mode = "blend-weight"
+# Per-preset weights map for blend-weight mode.
+# Required for blend-weight presets:
+# - every font_id in this preset's font_ids must have an entry
+# - every weight must be a positive integer (>0)
+# - if a font does not provide a strip, its weight is excluded for that strip's share math
+weights = { roland_sc_55 = 30, opl3 = 20, sbhq = 20 }
+
+[[presets]]
+id = "dos"
+display_name = "dos"
+description = "DOS OPL"
+font_ids = ["retro","opl3"]
+blend_mode = "blend-even"
+
+[[presets]]
+id = "realistic"
+display_name = "Realistic"
+description = "Layered realistic set, newest font wins by coverage"
+font_ids = ["hiqual","sonivox_gs250"]
+blend_mode = "blend-even"

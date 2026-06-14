@@ -1,0 +1,12 @@
+[package]
+name = "flutz_audio_wasapi"
+version = "0.1.0"
+edition.workspace = true
+description = "Experimental WASAPI audio-output wrapper primitives."
+
+[dependencies]
+flutz_audio_sdl3 = { path = "../flutz_audio_sdl3" }
+wasapi = "0.23"
+
+[lints]
+workspace = true

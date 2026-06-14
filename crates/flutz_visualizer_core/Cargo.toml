@@ -1,0 +1,11 @@
+[package]
+name = "flutz_visualizer_core"
+version = "0.1.0"
+edition.workspace = true
+description = "Reusable spectrum visualizer DSP and dynamics for flutzPlayer."
+
+[dependencies]
+rustfft = "6.2"
+
+[lints]
+workspace = true

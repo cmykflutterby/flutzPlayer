@@ -1,0 +1,17 @@
+[package]
+name = "flutz_soundfont_tools"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+flutz_core = { path = "../flutz_core" }
+flutz_dat = { path = "../flutz_dat" }
+flutz_fmid = { path = "../flutz_fmid" }
+flutz_synth = { path = "../flutz_synth" }
+miniz_oxide = "0.8"
+rustystem = { path = "../rustystem" }
+serde = "1"
+serde_json = "1"
+
+[lints]
+workspace = true

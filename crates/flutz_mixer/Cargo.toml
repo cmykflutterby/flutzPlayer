@@ -1,0 +1,11 @@
+[package]
+name = "flutz_mixer"
+version = "0.1.0"
+edition.workspace = true
+description = "Reusable audio mixer primitives for flutzPlayer and other audio projects."
+
+[dependencies]
+flutz_core = { path = "../flutz_core" }
+
+[lints]
+workspace = true

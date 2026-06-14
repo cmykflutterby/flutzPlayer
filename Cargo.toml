@@ -1,0 +1,44 @@
+[workspace]
+members = [
+    "crates/flutz_app",
+    "crates/flutz_audio_sdl3",
+    "crates/flutz_audio_wasapi",
+    "crates/flutz_core",
+    "crates/flutz_dat",
+    "crates/flutz_fmid",
+    "crates/flutz_mixer",
+    "crates/rustystem",
+    "crates/flutz_soundfont_tools",
+    "crates/flutz_synth",
+    "crates/flutz_visualizer_core",
+    "crates/flutz_visualizer_egui",
+]
+resolver = "2"
+exclude = ["vendor/tikv-jemalloc-sys"]
+
+[workspace.package]
+edition = "2021"
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+
+[patch.crates-io]
+tikv-jemalloc-sys = { path = "vendor/tikv-jemalloc-sys" }
+
+[profile.dev.package.flutz_audio_sdl3]
+opt-level = 2
+
+[profile.dev.package.flutz_audio_wasapi]
+opt-level = 2
+
+[profile.dev.package.flutz_mixer]
+opt-level = 2
+
+[profile.dev.package.flutz_synth]
+opt-level = 2
+
+[profile.dev.package.flutz_visualizer_core]
+opt-level = 2
+
+[profile.dev.package.rustystem]
+opt-level = 2

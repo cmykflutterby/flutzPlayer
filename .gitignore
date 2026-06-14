@@ -1,0 +1,8 @@
+_local
+.cargo
+vendor
+Cargo.lock
+drops
+MIDI Files
+design-docs
+soundfonts/*.sf2
