@@ -3,8 +3,8 @@ name: Release Build
 on:
   workflow_dispatch:
   push:
-    tags:
-      - "v*"
+    branches:
+      - main
 
 permissions:
   contents: write
@@ -19,37 +19,130 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
       - name: Install MSYS2 Toolchain
         uses: msys2/setup-msys2@v2
         with:
           update: true
           install: >-
             base-devel
+            mingw-w64-x86_64-egl-headers
             mingw-w64-x86_64-toolchain
 
-      - name: Cache Cargo Artifacts
-        uses: Swatinem/rust-cache@v2
+      - name: Install Rust (GNU toolchain)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable-x86_64-pc-windows-gnu
+
+      - name: Export MSYS2 Tool Paths
+        shell: pwsh
+        run: |
+          function New-PathAlias {
+            param(
+              [Parameter(Mandatory = $true)][string]$SourcePath,
+              [Parameter(Mandatory = $true)][string]$AliasName
+            )
+
+            $aliasRoot = Join-Path ([System.IO.Path]::GetTempPath()) $AliasName
+            if (Test-Path -LiteralPath $aliasRoot) {
+              Remove-Item -Recurse -Force -LiteralPath $aliasRoot
+            }
+
+            New-Item -ItemType Junction -Path $aliasRoot -Target $SourcePath | Out-Null
+            return $aliasRoot
+          }
+
+          $toolRootCandidates = @(
+            'C:\msys64\mingw64\bin',
+            'C:\mingw64\bin',
+            'C:\msys64\ucrt64\bin',
+            'C:\msys64\clang64\bin'
+          )
+          $shellRootCandidates = @(
+            'C:\msys64\usr\bin',
+            'C:\mingw64\bin',
+            'C:\Program Files\Git\usr\bin',
+            'C:\Program Files\Git\bin'
+          )
+
+          $selectedToolRoot = $toolRootCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+          $selectedShellRoot = $shellRootCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+
+          if ($null -eq $selectedToolRoot) {
+            throw "Could not locate a GNU tool root. Checked: $($toolRootCandidates -join ', ')"
+          }
+          if ($null -eq $selectedShellRoot) {
+            throw "Could not locate a POSIX shell root. Checked: $($shellRootCandidates -join ', ')"
+          }
+
+          if ($selectedToolRoot -match '\s') {
+            $selectedToolRoot = New-PathAlias -SourcePath $selectedToolRoot -AliasName 'flutz-gh-gnu-tool-root'
+          }
+          if ($selectedShellRoot -match '\s') {
+            $selectedShellRoot = New-PathAlias -SourcePath $selectedShellRoot -AliasName 'flutz-gh-gnu-shell-root'
+          }
+
+          $includeRoots = @(
+            (Join-Path (Split-Path -Parent $selectedToolRoot) 'include'),
+            'C:\msys64\mingw64\include',
+            'C:\mingw64\include'
+          ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -Unique
+
+          if ($includeRoots.Count -gt 0) {
+            $includePath = ($includeRoots -join ';')
+            Add-Content -LiteralPath $env:GITHUB_ENV -Value "CPATH=$includePath"
+            Add-Content -LiteralPath $env:GITHUB_ENV -Value "C_INCLUDE_PATH=$includePath"
+            Add-Content -LiteralPath $env:GITHUB_ENV -Value "CPLUS_INCLUDE_PATH=$includePath"
+            Write-Host "Added include roots $includePath"
+          }
+
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "FLUTZ_GNU_TOOL_ROOT=$selectedToolRoot"
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "FLUTZ_GNU_SHELL_ROOT=$selectedShellRoot"
+          Add-Content -LiteralPath $env:GITHUB_PATH -Value $selectedToolRoot
+          Add-Content -LiteralPath $env:GITHUB_PATH -Value $selectedShellRoot
+          Write-Host "Added tool root $selectedToolRoot and shell root $selectedShellRoot"
+
+      - name: Prepare Vendor Sources
+        shell: pwsh
+        run: ./gh/Prepare-GhVendor.ps1
 
       - name: Build Release Drop
         shell: pwsh
+        env:
+          FLUTZ_SOUNDFONT_URL: ${{ secrets.FLUTZ_SOUNDFONT_URL }}
+          CMAKE_ARGS: >-
+            -DSDL_OPENGL=OFF
+            -DSDL_OPENGLES=OFF
+            -DSDL_RENDER_GPU=OFF
+            -DSDL_RENDER_VULKAN=OFF
         run: ./gh/Invoke-GhReleaseBuild.ps1 -Configuration Release
+
+      - name: Generate Release Name
+        id: release_name
+        shell: pwsh
+        run: |
+          $stamp = Get-Date -AsUTC -Format 'yyMMddHHmmss'
+          $archiveName = "flutzPlayer-Windows-x64-$stamp.zip"
+          "stamp=$stamp" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "archive_name=$archiveName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "FLUTZ_RELEASE_STAMP=$stamp"
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "FLUTZ_RELEASE_ARCHIVE_NAME=$archiveName"
+          Write-Host "Release archive name: $archiveName"
 
       - name: Package Release Zip
         shell: pwsh
-        run: ./gh/Package-GhRelease.ps1 -OutputDirectory artifacts -ArchiveName flutzplayer-windows-x64.zip
+        run: ./gh/Package-GhRelease.ps1 -OutputDirectory artifacts -ArchiveName $env:FLUTZ_RELEASE_ARCHIVE_NAME
 
       - name: Upload Workflow Artifact
         uses: actions/upload-artifact@v4
         with:
           name: flutzplayer-windows-x64
-          path: artifacts/flutzplayer-windows-x64.zip
+          path: artifacts/${{ steps.release_name.outputs.archive_name }}
           if-no-files-found: error
 
       - name: Publish GitHub Release Asset
-        if: startsWith(github.ref, 'refs/tags/')
+        if: github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/flutzplayer-windows-x64.zip
+          tag_name: main-${{ steps.release_name.outputs.stamp }}
+          name: flutzPlayer Windows x64 ${{ steps.release_name.outputs.stamp }}
+          files: artifacts/${{ steps.release_name.outputs.archive_name }}
