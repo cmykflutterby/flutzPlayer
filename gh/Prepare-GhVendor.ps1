@@ -226,6 +226,33 @@ optional = true
     [System.IO.File]::WriteAllText($manifestPath, $updated)
 }
 
+function Patch-Sdl3SysBuildScript {
+    param([Parameter(Mandatory = $true)][string]$Sdl3SysRoot)
+
+    $buildScriptPath = Join-Path $Sdl3SysRoot "build.rs"
+    if (-not (Test-Path -LiteralPath $buildScriptPath)) {
+        throw "Expected sdl3-sys build.rs not found: $buildScriptPath"
+    }
+
+    $buildScript = [System.IO.File]::ReadAllText($buildScriptPath)
+
+    if ($buildScript -notmatch 'SDL_OPENGLES') {
+        $buildScript = $buildScript -replace [regex]::Escape('            config.define("SDL_TESTS", "OFF");'), @'
+            config.define("SDL_TESTS", "OFF");
+            config.define("SDL_OPENGL", "OFF");
+            config.define("SDL_OPENGLES", "OFF");
+            config.define("SDL_RENDER_GPU", "OFF");
+            config.define("SDL_RENDER_VULKAN", "OFF");
+'@
+    }
+
+    if ($buildScript -notmatch 'config\.define\("SDL_OPENGLES", "OFF"\);') {
+        throw 'Failed to patch sdl3-sys build.rs with deterministic SDL CMake options.'
+    }
+
+    [System.IO.File]::WriteAllText($buildScriptPath, $buildScript)
+}
+
 function Copy-CrateSource {
     param(
         [Parameter(Mandatory = $true)][string]$CrateName,
@@ -237,6 +264,8 @@ function Copy-CrateSource {
     if (Test-Path -LiteralPath $destinationManifest) {
         if ($CrateName -eq 'tikv-jemalloc-sys') {
             Patch-JemallocBuildScript -SourceRoot $DestinationPath
+        } elseif ($CrateName -eq 'sdl3-sys') {
+            Patch-Sdl3SysBuildScript -Sdl3SysRoot $DestinationPath
         }
 
         return
@@ -279,6 +308,8 @@ function Copy-CrateSource {
 
     if ($CrateName -eq 'tikv-jemalloc-sys') {
         Patch-JemallocBuildScript -SourceRoot $DestinationPath
+    } elseif ($CrateName -eq 'sdl3-sys') {
+        Patch-Sdl3SysBuildScript -Sdl3SysRoot $DestinationPath
     }
 }
 
@@ -287,6 +318,7 @@ if ((Test-Path -LiteralPath (Join-Path $Sdl3SysDestination "Cargo.toml")) -and (
     if (-not (Test-Path -LiteralPath (Join-Path $Sdl3SrcDestination "Cargo.toml"))) {
         Copy-CrateSource -CrateName 'sdl3-src' -Version $Sdl3SrcVersion -DestinationPath $Sdl3SrcDestination
     }
+    Patch-Sdl3SysBuildScript -Sdl3SysRoot $Sdl3SysDestination
     Patch-Sdl3SysManifest -Sdl3SysRoot $Sdl3SysDestination -Sdl3SrcRoot $Sdl3SrcDestination
     exit 0
 }
