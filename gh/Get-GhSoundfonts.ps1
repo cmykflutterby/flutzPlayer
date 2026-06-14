@@ -7,6 +7,8 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 
+$DefaultSoundfontUrl = 'https://www.dropbox.com/scl/fo/836g10pf6esxjlmc0c8ds/AIdCVveJE03AMpr47auM4fI?rlkey=8bz19qtfijxh2z0bjsj9tswur&st=bno1017i&dl=1'
+
 $RequiredFonts = @(
     '8bitsf.SF2',
     'Arachno_SoundFont_Version_1.0.sf2',
@@ -24,10 +26,7 @@ $RequiredFonts = @(
     'Yamaha_XG_Sound_Set.sf2'
 )
 
-$SoundfontUrl = $env:FLUTZ_SOUNDFONT_URL
-if ([string]::IsNullOrWhiteSpace($SoundfontUrl)) {
-    throw 'FLUTZ_SOUNDFONT_URL environment variable is not set. Configure it as a GitHub Actions secret pointing to a zip archive containing the required soundfont files.'
-}
+$SoundfontUrl = if ([string]::IsNullOrWhiteSpace($env:FLUTZ_SOUNDFONT_URL)) { $DefaultSoundfontUrl } else { $env:FLUTZ_SOUNDFONT_URL }
 
 New-Item -ItemType Directory -Force -Path $DestinationDirectory | Out-Null
 

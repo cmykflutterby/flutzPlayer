@@ -79,6 +79,12 @@ try {
         throw "Prepare-GhVendor.ps1 failed with exit code $LASTEXITCODE"
     }
 
+    Write-Host "Ensuring required soundfonts are present"
+    & $GhSoundfontScript -DestinationDirectory (Join-Path $RepoRoot "soundfonts")
+    if ($LASTEXITCODE -ne 0) {
+        throw "Get-GhSoundfonts.ps1 failed with exit code $LASTEXITCODE"
+    }
+
 
     if (Test-Path -LiteralPath $DropRoot) {
         Remove-Item -Recurse -Force -LiteralPath $DropRoot

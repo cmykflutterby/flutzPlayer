@@ -105,6 +105,20 @@ jobs:
         shell: pwsh
         run: ./gh/Prepare-GhVendor.ps1
 
+      - name: Restore Soundfont Cache
+        uses: actions/cache@v4
+        with:
+          path: soundfonts
+          key: flutz-windows-soundfonts-v1-${{ hashFiles('gh/Get-GhSoundfonts.ps1') }}
+
+      - name: Restore DAT Cache
+        uses: actions/cache@v4
+        with:
+          path: .gh-cache/dat-packs
+          key: flutz-windows-dat-v1-${{ hashFiles('assets/dat-manifest.toml', 'soundfonts/*.sf2') }}
+          restore-keys: |
+            flutz-windows-dat-v1-
+
       - name: Build Release Drop
         shell: pwsh
         env:
