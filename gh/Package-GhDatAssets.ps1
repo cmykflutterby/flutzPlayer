@@ -100,6 +100,25 @@ if ($soundfontFiles.Count -eq 0) {
     Write-Host "⚠️  No soundfont files found in $SoundfontDir"
     Write-Host "    Skipping DAT packing; this will be a binary-only release"
     Write-Host "    (Soundfonts are gitignored; run 'soundfonts/get-fonts.ps1' locally to include them)"
+    # Verify manifest exists
+    if (-not (Test-Path -LiteralPath $DatManifest)) {
+        throw "DAT manifest not found: $DatManifest"
+    }
+
+    # Check if soundfonts exist (they may be gitignored and unavailable in CI)
+    if (-not (Test-Path -LiteralPath $SoundfontDir)) {
+        Write-Host "⚠️  Soundfont directory not found at $SoundfontDir"
+        Write-Host "    Skipping DAT packing; this will be a binary-only release"
+        return
+    }
+
+    $soundfontFiles = @(Get-ChildItem -LiteralPath $SoundfontDir -Filter "*.sf2" -File)
+    if ($soundfontFiles.Count -eq 0) {
+        Write-Host "⚠️  No soundfont files found in $SoundfontDir"
+        Write-Host "    Skipping DAT packing; this will be a binary-only release"
+        Write-Host "    (Soundfonts are gitignored; run 'soundfonts/get-fonts.ps1' locally to include them)"
+        return
+    }
     return
 }
 }
