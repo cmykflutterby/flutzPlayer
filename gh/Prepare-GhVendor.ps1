@@ -202,14 +202,25 @@ path = "$sdl3SrcPathToml"
 optional = true
 "@
 
-    $updated = [regex]::Replace(
-        $manifest,
-        '(?ms)^\[build-dependencies\.sdl3-src\]\r?\n.*?(?=^\[|\z)',
-        "$replacement`r`n"
-    )
+    if ($manifest -match '(?ms)^\[build-dependencies\.sdl3-src\]') {
+        $updated = [regex]::Replace(
+            $manifest,
+            '(?ms)^\[build-dependencies\.sdl3-src\]\r?\n.*?(?=^\[|\z)',
+            "$replacement`r`n"
+        )
+    } elseif ($manifest -match '(?ms)^\[build-dependencies\]') {
+        $updated = [regex]::Replace(
+            $manifest,
+            '(?ms)^\[build-dependencies\]\r?\n',
+            "[build-dependencies]`r`n`r`n$replacement`r`n",
+            1
+        )
+    } else {
+        $updated = "$manifest`r`n$replacement`r`n"
+    }
 
-    if ($updated -eq $manifest) {
-        throw 'Failed to patch sdl3-sys Cargo.toml to use vendored sdl3-src path.'
+    if ($updated -notmatch '(?ms)^\[build-dependencies\.sdl3-src\]\r?\n\s*path\s*=\s*"') {
+        throw 'Failed to patch sdl3-sys Cargo.toml with a vendored sdl3-src path.'
     }
 
     [System.IO.File]::WriteAllText($manifestPath, $updated)
