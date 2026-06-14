@@ -219,3 +219,37 @@ foreach ($requiredPath in @(
 
 Write-Host "Vendored SDL3 source ready at $Sdl3SysDestination"
 Write-Host "Vendored jemalloc source ready at $JemallocRoot"
+
+# Write .cargo/config.toml so cargo uses the GNU target and the MSYS2 shell.
+# The shell path is required for jemalloc's autoconf configure step.
+$msys2Sh = 'C:\msys64\usr\bin\sh.exe'
+$msys2GccDir = 'C:\msys64\mingw64\bin'
+if (-not (Test-Path -LiteralPath $msys2Sh)) {
+    throw "MSYS2 sh.exe not found at $msys2Sh - cannot configure jemalloc build"
+}
+
+$cargoConfigDir = Join-Path $RepoRoot '.cargo'
+$cargoConfigPath = Join-Path $cargoConfigDir 'config.toml'
+Ensure-Directory -Path $cargoConfigDir
+
+$linkerPath = Join-Path $msys2GccDir 'gcc.exe'
+if (-not (Test-Path -LiteralPath $linkerPath)) {
+    throw "MinGW64 gcc.exe not found at $linkerPath"
+}
+
+# Forward slashes are required in TOML strings passed to cargo
+$msys2ShToml = $msys2Sh -replace '\\', '/'
+$linkerPathToml = $linkerPath -replace '\\', '/'
+
+Set-Content -LiteralPath $cargoConfigPath -Value @"
+[build]
+target-dir = "target"
+
+[target.x86_64-pc-windows-gnu]
+linker = "$linkerPathToml"
+
+[env]
+CONFIG_SHELL = "$msys2ShToml"
+"@
+
+Write-Host "Wrote .cargo/config.toml (GNU target, MSYS2 shell)"
