@@ -30,11 +30,17 @@ jobs:
             base-devel
             mingw-w64-x86_64-toolchain
 
+      - name: Prepare Vendor Sources
+        shell: pwsh
+        run: ./gh/Prepare-GhVendor.ps1
+
       - name: Cache Cargo Artifacts
         uses: Swatinem/rust-cache@v2
 
       - name: Build Release Drop
         shell: pwsh
+        env:
+          FLUTZ_SOUNDFONT_URL: ${{ secrets.FLUTZ_SOUNDFONT_URL }}
         run: ./gh/Invoke-GhReleaseBuild.ps1 -Configuration Release
 
       - name: Package Release Zip

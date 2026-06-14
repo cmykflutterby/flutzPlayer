@@ -8,7 +8,7 @@ $ErrorActionPreference = "Stop"
 
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $PrepareVendorScript = Join-Path $PSScriptRoot "Prepare-GhVendor.ps1"
-$SoundfontBootstrap = Join-Path $RepoRoot "soundfonts/get-fonts.ps1"
+$GhSoundfontScript = Join-Path $PSScriptRoot "Get-GhSoundfonts.ps1"
 $DatManifest = Join-Path $RepoRoot "assets/dat-manifest.toml"
 $GeneratedDatRoot = Join-Path $RepoRoot "_local/generated-assets/dat"
 $GeneratedDatFile = Join-Path $GeneratedDatRoot "assets.dat"
@@ -68,8 +68,8 @@ try {
     if (-not (Test-Path -LiteralPath $PrepareVendorScript)) {
         throw "Missing GH vendor bootstrap script: $PrepareVendorScript"
     }
-    if (-not (Test-Path -LiteralPath $SoundfontBootstrap)) {
-        throw "Missing soundfont bootstrap script: $SoundfontBootstrap"
+    if (-not (Test-Path -LiteralPath $GhSoundfontScript)) {
+        throw "Missing GH soundfont script: $GhSoundfontScript"
     }
     if (-not (Test-Path -LiteralPath $DatManifest)) {
         throw "Missing DAT manifest: $DatManifest"
@@ -81,10 +81,17 @@ try {
         throw "Prepare-GhVendor.ps1 failed with exit code $LASTEXITCODE"
     }
 
-    Write-Host "Ensuring soundfont assets"
-    & $SoundfontBootstrap
-    if ($LASTEXITCODE -ne 0) {
-        throw "get-fonts.ps1 failed with exit code $LASTEXITCODE"
+    $hasSoundfonts = -not [string]::IsNullOrWhiteSpace($env:FLUTZ_SOUNDFONT_URL)
+    $soundfontDir = Join-Path $RepoRoot "soundfonts"
+
+    if ($hasSoundfonts) {
+        Write-Host "Acquiring soundfont assets"
+        & $GhSoundfontScript -DestinationDirectory $soundfontDir
+        if ($LASTEXITCODE -ne 0) {
+            throw "Get-GhSoundfonts.ps1 failed with exit code $LASTEXITCODE"
+        }
+    } else {
+        Write-Host "FLUTZ_SOUNDFONT_URL not set; skipping soundfont download and DAT packing (binary-only build)"
     }
 
     if (Test-Path -LiteralPath $DropRoot) {
@@ -98,15 +105,17 @@ try {
     $profileFolder = if ($Configuration -eq "Release") { "release" } else { "debug" }
     $cargoModeArgs = if ($Configuration -eq "Release") { @("--release") } else { @() }
 
-    Write-Host "Packing DAT assets"
-    $datPackArgs = @("run", "-p", "flutz_soundfont_tools") + $cargoModeArgs + @(
-        "--",
-        "--pack",
-        "--input", $DatManifest,
-        "--output", $GeneratedDatFile,
-        "--base-dir", $RepoRoot
-    )
-    Invoke-Cargo -CargoExe $CargoExe -Args $datPackArgs
+    if ($hasSoundfonts) {
+        Write-Host "Packing DAT assets"
+        $datPackArgs = @("run", "-p", "flutz_soundfont_tools") + $cargoModeArgs + @(
+            "--",
+            "--pack",
+            "--input", $DatManifest,
+            "--output", $GeneratedDatFile,
+            "--base-dir", $RepoRoot
+        )
+        Invoke-Cargo -CargoExe $CargoExe -Args $datPackArgs
+    }
 
     Write-Host "Building flutzplayer binary"
     $appBuildArgs = @("build", "-p", "flutz_app", "--features", "jemalloc-memory") + $cargoModeArgs
@@ -134,7 +143,7 @@ try {
     Copy-Item -Force -LiteralPath $DatManifest -Destination (Join-Path $DropDatPacker "dat-manifest.toml")
 
     $generatedDatFiles = @(Get-ChildItem -LiteralPath $GeneratedDatRoot -Filter "*.dat" -File -ErrorAction SilentlyContinue)
-    if ($generatedDatFiles.Count -eq 0) {
+    if ($generatedDatFiles.Count -eq 0 -and $hasSoundfonts) {
         throw "No DAT files generated in $GeneratedDatRoot"
     }
     foreach ($datFile in $generatedDatFiles) {
