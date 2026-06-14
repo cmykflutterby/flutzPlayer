@@ -109,6 +109,11 @@ jobs:
         shell: pwsh
         env:
           FLUTZ_SOUNDFONT_URL: ${{ secrets.FLUTZ_SOUNDFONT_URL }}
+          CMAKE_ARGS: >-
+            -DSDL_OPENGL=OFF
+            -DSDL_OPENGLES=OFF
+            -DSDL_RENDER_GPU=OFF
+            -DSDL_RENDER_VULKAN=OFF
         run: ./gh/Invoke-GhReleaseBuild.ps1 -Configuration Release
 
       - name: Package Release Zip
