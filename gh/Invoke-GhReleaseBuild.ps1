@@ -17,6 +17,7 @@ $DropData = Join-Path $DropRoot "data"
 $DropDatPacker = Join-Path $DropRoot "dat-packer"
 $TargetRoot = Join-Path $RepoRoot "target"
 $DatPackerWrapper = Join-Path $RepoRoot "tools/dat-packer/pack-dat.ps1"
+$PackageDatScript = Join-Path $PSScriptRoot "Package-GhDatAssets.ps1"
 
 function Initialize-NoSpaceWorkspaceRoot {
     param([Parameter(Mandatory = $true)][string]$ActualRepoRoot)
@@ -71,9 +72,6 @@ try {
     if (-not (Test-Path -LiteralPath $GhSoundfontScript)) {
         throw "Missing GH soundfont script: $GhSoundfontScript"
     }
-    if (-not (Test-Path -LiteralPath $DatManifest)) {
-        throw "Missing DAT manifest: $DatManifest"
-    }
 
     Write-Host "Hydrating GH vendored crate sources"
     & $PrepareVendorScript
@@ -81,18 +79,6 @@ try {
         throw "Prepare-GhVendor.ps1 failed with exit code $LASTEXITCODE"
     }
 
-    $hasSoundfonts = -not [string]::IsNullOrWhiteSpace($env:FLUTZ_SOUNDFONT_URL)
-    $soundfontDir = Join-Path $RepoRoot "soundfonts"
-
-    if (-not $hasSoundfonts) {
-        throw "FLUTZ_SOUNDFONT_URL environment variable is not set. DAT files are required for release builds. Please configure the FLUTZ_SOUNDFONT_URL secret in GitHub Actions settings."
-    }
-
-    Write-Host "Acquiring soundfont assets from FLUTZ_SOUNDFONT_URL"
-    & $GhSoundfontScript -DestinationDirectory $soundfontDir
-    if ($LASTEXITCODE -ne 0) {
-        throw "Get-GhSoundfonts.ps1 failed with exit code $LASTEXITCODE"
-    }
 
     if (Test-Path -LiteralPath $DropRoot) {
         Remove-Item -Recurse -Force -LiteralPath $DropRoot
@@ -105,17 +91,6 @@ try {
     $profileFolder = if ($Configuration -eq "Release") { "release" } else { "debug" }
     $cargoModeArgs = if ($Configuration -eq "Release") { @("--release") } else { @() }
 
-    if ($hasSoundfonts) {
-        Write-Host "Packing DAT assets"
-        $datPackArgs = @("run", "-p", "flutz_soundfont_tools") + $cargoModeArgs + @(
-            "--",
-            "--pack",
-            "--input", $DatManifest,
-            "--output", $GeneratedDatFile,
-            "--base-dir", $RepoRoot
-        )
-        Invoke-Cargo -CargoExe $CargoExe -Args $datPackArgs
-    }
 
     Write-Host "Building flutzplayer binary"
     $appBuildArgs = @("build", "-p", "flutz_app", "--features", "jemalloc-memory") + $cargoModeArgs
@@ -142,15 +117,12 @@ try {
     }
     Copy-Item -Force -LiteralPath $DatManifest -Destination (Join-Path $DropDatPacker "dat-manifest.toml")
 
-    $generatedDatFiles = @(Get-ChildItem -LiteralPath $GeneratedDatRoot -Filter "*.dat" -File -ErrorAction SilentlyContinue)
-    if ($generatedDatFiles.Count -eq 0) {
-        throw "No DAT files were generated. The soundfont packing step did not complete successfully. Check DAT manifest configuration and soundfont availability."
-    }
-    foreach ($datFile in $generatedDatFiles) {
-        Copy-Item -Force -LiteralPath $datFile.FullName -Destination (Join-Path $DropData $datFile.Name)
-    }
-    Write-Host "Copied $($generatedDatFiles.Count) DAT file(s) to release drop"
 
+    Write-Host "Packing and caching DAT assets"
+    & $PackageDatScript -Configuration $Configuration -OutputDirectory $DropData
+    if ($LASTEXITCODE -ne 0) {
+        throw "Package-GhDatAssets.ps1 failed with exit code $LASTEXITCODE"
+    }
     $stagedSdlDlls = @(Get-ChildItem -Path $DropRoot -Filter "SDL3.dll" -File -Recurse -ErrorAction SilentlyContinue)
     if ($stagedSdlDlls.Count -gt 0) {
         $stagedSdlDllList = ($stagedSdlDlls | ForEach-Object { $_.FullName }) -join ", "

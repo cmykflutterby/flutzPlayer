@@ -108,7 +108,6 @@ jobs:
       - name: Build Release Drop
         shell: pwsh
         env:
-          FLUTZ_SOUNDFONT_URL: ${{ secrets.FLUTZ_SOUNDFONT_URL }}
           CMAKE_ARGS: >-
             -DSDL_OPENGL=OFF
             -DSDL_OPENGLES=OFF
