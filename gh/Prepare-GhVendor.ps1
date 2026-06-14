@@ -7,9 +7,7 @@ $Sdl3Root = Join-Path $VendorRoot "SDL3"
 $JemallocRoot = Join-Path $VendorRoot "tikv-jemalloc-sys"
 $Sdl3SysVersion = "0.6.2+SDL-3.4.4"
 $JemallocVersion = "0.6.1"
-$Sdl3SysPackageName = "sdl3-sys-$Sdl3SysVersion"
 $Sdl3SysDestination = Join-Path $Sdl3Root "sdl3-sys-0.6.2+SDL-3.4.4-spacefix"
-$JemallocPackageName = "tikv-jemalloc-sys-$JemallocVersion"
 
 function Ensure-Directory {
     param([Parameter(Mandatory = $true)][string]$Path)
@@ -23,6 +21,22 @@ function Resolve-CargoExecutable {
     }
 
     return $cargoCommand.Source
+}
+
+function Resolve-ToolExecutable {
+    param(
+        [Parameter(Mandatory = $true)][string[]]$Names,
+        [Parameter(Mandatory = $true)][string]$ToolDescription
+    )
+
+    foreach ($name in $Names) {
+        $command = Get-Command $name -CommandType Application -ErrorAction SilentlyContinue
+        if ($null -ne $command) {
+            return $command.Source
+        }
+    }
+
+    throw "Could not locate $ToolDescription in the active environment. Tried: $($Names -join ', ')"
 }
 
 function Remove-PathIfPresent {
@@ -220,26 +234,19 @@ foreach ($requiredPath in @(
 Write-Host "Vendored SDL3 source ready at $Sdl3SysDestination"
 Write-Host "Vendored jemalloc source ready at $JemallocRoot"
 
-# Write .cargo/config.toml so cargo uses the GNU target and the MSYS2 shell.
+# Write .cargo/config.toml so cargo uses the GNU target and the discovered shell.
 # The shell path is required for jemalloc's autoconf configure step.
-$msys2Sh = 'C:\msys64\usr\bin\sh.exe'
-$msys2GccDir = 'C:\msys64\mingw64\bin'
-if (-not (Test-Path -LiteralPath $msys2Sh)) {
-    throw "MSYS2 sh.exe not found at $msys2Sh - cannot configure jemalloc build"
-}
 
 $cargoConfigDir = Join-Path $RepoRoot '.cargo'
 $cargoConfigPath = Join-Path $cargoConfigDir 'config.toml'
 Ensure-Directory -Path $cargoConfigDir
 
-$linkerPath = Join-Path $msys2GccDir 'gcc.exe'
-if (-not (Test-Path -LiteralPath $linkerPath)) {
-    throw "MinGW64 gcc.exe not found at $linkerPath"
-}
+$shellPath = Resolve-ToolExecutable -Names @('sh.exe', 'bash.exe', 'sh', 'bash') -ToolDescription 'a POSIX shell (sh.exe or bash.exe)'
+$linkerPath = Resolve-ToolExecutable -Names @('gcc.exe', 'x86_64-w64-mingw32-gcc.exe', 'gcc') -ToolDescription 'a GNU C compiler (gcc.exe)'
 
 # Forward slashes are required in TOML strings passed to cargo
-$msys2ShToml = $msys2Sh -replace '\\', '/'
 $linkerPathToml = $linkerPath -replace '\\', '/'
+$shellPathToml = $shellPath -replace '\\', '/'
 
 Set-Content -LiteralPath $cargoConfigPath -Value @"
 [build]
@@ -249,7 +256,7 @@ target-dir = "target"
 linker = "$linkerPathToml"
 
 [env]
-CONFIG_SHELL = "$msys2ShToml"
+CONFIG_SHELL = "$shellPathToml"
 "@
 
 Write-Host "Wrote .cargo/config.toml (GNU target, MSYS2 shell)"

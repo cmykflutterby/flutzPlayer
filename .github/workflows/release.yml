@@ -32,16 +32,6 @@ jobs:
         with:
           toolchain: stable-x86_64-pc-windows-gnu
 
-      - name: Add MinGW64 to PATH
-        shell: pwsh
-        run: |
-          $mingw64Bin = "C:\msys64\mingw64\bin"
-          if (-not (Test-Path -LiteralPath $mingw64Bin)) {
-            throw "MSYS2 MinGW64 bin not found at $mingw64Bin"
-          }
-          Add-Content -LiteralPath $env:GITHUB_PATH -Value $mingw64Bin
-          Write-Host "Added $mingw64Bin to GITHUB_PATH"
-
       - name: Prepare Vendor Sources
         shell: pwsh
         run: ./gh/Prepare-GhVendor.ps1
