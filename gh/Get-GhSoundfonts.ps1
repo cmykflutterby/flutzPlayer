@@ -56,10 +56,17 @@ if (-not (Test-Path -LiteralPath $archivePath)) {
     throw "Soundfont archive download did not produce a file at: $archivePath"
 }
 
-$archiveBytes = [System.IO.File]::ReadAllBytes($archivePath)
-if ($archiveBytes.Length -lt 4 -or $archiveBytes[0] -ne 0x50 -or $archiveBytes[1] -ne 0x4B) {
-    $preview = [System.Text.Encoding]::UTF8.GetString($archiveBytes, 0, [Math]::Min(512, $archiveBytes.Length))
-    throw "Downloaded file is not a valid ZIP archive (bad magic bytes). The URL may require authentication or returned an error page.`nContent preview:`n$preview"
+$stream = [System.IO.File]::OpenRead($archivePath)
+try {
+    $header = New-Object byte[] 4
+    $read = $stream.Read($header, 0, $header.Length)
+}
+finally {
+    $stream.Dispose()
+}
+
+if ($read -lt 4 -or $header[0] -ne 0x50 -or $header[1] -ne 0x4B) {
+    throw "Downloaded file is not a valid ZIP archive (bad magic bytes). The URL may require authentication or returned an error page."
 }
 
 $extractRoot = Join-Path $downloadRoot 'extract'
