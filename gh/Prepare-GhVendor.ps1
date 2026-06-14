@@ -251,13 +251,16 @@ $cargoConfigDir = Join-Path $RepoRoot '.cargo'
 $cargoConfigPath = Join-Path $cargoConfigDir 'config.toml'
 Ensure-Directory -Path $cargoConfigDir
 
+$shellRoot = $env:FLUTZ_GNU_SHELL_ROOT
 $toolRoot = $env:FLUTZ_GNU_TOOL_ROOT
-$shellPath = Resolve-ToolExecutable -Names @('sh.exe', 'bash.exe', 'sh', 'bash') -ToolDescription 'a POSIX shell (sh.exe or bash.exe)' -PreferredRoot $toolRoot
+$shellPath = Resolve-ToolExecutable -Names @('sh.exe', 'bash.exe', 'sh', 'bash') -ToolDescription 'a POSIX shell (sh.exe or bash.exe)' -PreferredRoot $shellRoot
 $linkerPath = Resolve-ToolExecutable -Names @('gcc.exe', 'x86_64-w64-mingw32-gcc.exe', 'gcc') -ToolDescription 'a GNU C compiler (gcc.exe)' -PreferredRoot $toolRoot
+$arPath = Resolve-ToolExecutable -Names @('ar.exe', 'gcc-ar.exe', 'x86_64-w64-mingw32-ar.exe') -ToolDescription 'a GNU archiver (ar.exe)' -PreferredRoot $toolRoot
 
 # Forward slashes are required in TOML strings passed to cargo
 $linkerPathToml = $linkerPath -replace '\\', '/'
 $shellPathToml = $shellPath -replace '\\', '/'
+$arPathToml = $arPath -replace '\\', '/'
 
 Set-Content -LiteralPath $cargoConfigPath -Value @"
 [build]
@@ -267,6 +270,8 @@ target-dir = "target"
 linker = "$linkerPathToml"
 
 [env]
+CC = "$linkerPathToml"
+AR = "$arPathToml"
 CONFIG_SHELL = "$shellPathToml"
 "@
 

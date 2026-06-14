@@ -35,20 +35,56 @@ jobs:
       - name: Export MSYS2 Tool Paths
         shell: pwsh
         run: |
-          $candidateRoots = @(
+          function New-PathAlias {
+            param(
+              [Parameter(Mandatory = $true)][string]$SourcePath,
+              [Parameter(Mandatory = $true)][string]$AliasName
+            )
+
+            $aliasRoot = Join-Path ([System.IO.Path]::GetTempPath()) $AliasName
+            if (Test-Path -LiteralPath $aliasRoot) {
+              Remove-Item -Recurse -Force -LiteralPath $aliasRoot
+            }
+
+            New-Item -ItemType Junction -Path $aliasRoot -Target $SourcePath | Out-Null
+            return $aliasRoot
+          }
+
+          $toolRootCandidates = @(
             'C:\msys64\mingw64\bin',
+            'C:\mingw64\bin',
             'C:\msys64\ucrt64\bin',
             'C:\msys64\clang64\bin'
           )
+          $shellRootCandidates = @(
+            'C:\msys64\usr\bin',
+            'C:\mingw64\bin',
+            'C:\Program Files\Git\usr\bin',
+            'C:\Program Files\Git\bin'
+          )
 
-          $selectedRoot = $candidateRoots | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
-          if ($null -eq $selectedRoot) {
-            throw "Could not locate an MSYS2 MinGW/UCRT/Clang bin directory. Checked: $($candidateRoots -join ', ')"
+          $selectedToolRoot = $toolRootCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+          $selectedShellRoot = $shellRootCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+
+          if ($null -eq $selectedToolRoot) {
+            throw "Could not locate a GNU tool root. Checked: $($toolRootCandidates -join ', ')"
+          }
+          if ($null -eq $selectedShellRoot) {
+            throw "Could not locate a POSIX shell root. Checked: $($shellRootCandidates -join ', ')"
           }
 
-          Add-Content -LiteralPath $env:GITHUB_ENV -Value "FLUTZ_GNU_TOOL_ROOT=$selectedRoot"
-          Add-Content -LiteralPath $env:GITHUB_PATH -Value $selectedRoot
-          Write-Host "Added $selectedRoot to GITHUB_PATH"
+          if ($selectedToolRoot -match '\s') {
+            $selectedToolRoot = New-PathAlias -SourcePath $selectedToolRoot -AliasName 'flutz-gh-gnu-tool-root'
+          }
+          if ($selectedShellRoot -match '\s') {
+            $selectedShellRoot = New-PathAlias -SourcePath $selectedShellRoot -AliasName 'flutz-gh-gnu-shell-root'
+          }
+
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "FLUTZ_GNU_TOOL_ROOT=$selectedToolRoot"
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "FLUTZ_GNU_SHELL_ROOT=$selectedShellRoot"
+          Add-Content -LiteralPath $env:GITHUB_PATH -Value $selectedToolRoot
+          Add-Content -LiteralPath $env:GITHUB_PATH -Value $selectedShellRoot
+          Write-Host "Added tool root $selectedToolRoot and shell root $selectedShellRoot"
 
       - name: Prepare Vendor Sources
         shell: pwsh
