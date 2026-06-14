@@ -32,6 +32,23 @@ jobs:
         with:
           toolchain: stable-x86_64-pc-windows-gnu
 
+      - name: Export MSYS2 Tool Paths
+        shell: pwsh
+        run: |
+          $candidateRoots = @(
+            'C:\msys64\mingw64\bin',
+            'C:\msys64\ucrt64\bin',
+            'C:\msys64\clang64\bin'
+          )
+
+          $selectedRoot = $candidateRoots | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+          if ($null -eq $selectedRoot) {
+            throw "Could not locate an MSYS2 MinGW/UCRT/Clang bin directory. Checked: $($candidateRoots -join ', ')"
+          }
+
+          Add-Content -LiteralPath $env:GITHUB_PATH -Value $selectedRoot
+          Write-Host "Added $selectedRoot to GITHUB_PATH"
+
       - name: Prepare Vendor Sources
         shell: pwsh
         run: ./gh/Prepare-GhVendor.ps1
