@@ -239,12 +239,28 @@ function Copy-CrateSource {
 
     $packageName = "$CrateName-$Version"
     $registryRoot = Get-RegistrySourceRoot
-    $packageRoot = Get-ChildItem -LiteralPath $registryRoot -Recurse -Directory -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -like "$packageName*" } |
+
+    $candidates = @(Get-ChildItem -LiteralPath $registryRoot -Recurse -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -eq $packageName -or $_.Name -like "$packageName+*" })
+
+    if ($candidates.Count -eq 0) {
+        throw "Could not locate $packageName in the Cargo registry source cache under $registryRoot"
+    }
+
+    $preferredCandidates = @($candidates | Where-Object { $_.FullName -match 'index\.crates\.io-' })
+    $selectionPool = if ($preferredCandidates.Count -gt 0) { $preferredCandidates } else { $candidates }
+
+    $packageRoot = $selectionPool |
+        Sort-Object @{ Expression = { if ($_.Name -eq $packageName) { 0 } else { 1 } } }, @{ Expression = { $_.Name } } |
         Select-Object -First 1
 
     if ($null -eq $packageRoot) {
         throw "Could not locate $packageName in the Cargo registry source cache under $registryRoot"
+    }
+
+    if ($candidates.Count -gt 1) {
+        $candidateList = ($candidates | ForEach-Object { $_.FullName }) -join '; '
+        Write-Host "Multiple registry candidates found for $packageName; selected $($packageRoot.FullName). Candidates: $candidateList"
     }
 
     Ensure-Directory -Path (Split-Path -Parent $DestinationPath)
