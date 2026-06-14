@@ -81,6 +81,20 @@ jobs:
             $selectedShellRoot = New-PathAlias -SourcePath $selectedShellRoot -AliasName 'flutz-gh-gnu-shell-root'
           }
 
+          $includeRoots = @(
+            (Join-Path (Split-Path -Parent $selectedToolRoot) 'include'),
+            'C:\msys64\mingw64\include',
+            'C:\mingw64\include'
+          ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -Unique
+
+          if ($includeRoots.Count -gt 0) {
+            $includePath = ($includeRoots -join ';')
+            Add-Content -LiteralPath $env:GITHUB_ENV -Value "CPATH=$includePath"
+            Add-Content -LiteralPath $env:GITHUB_ENV -Value "C_INCLUDE_PATH=$includePath"
+            Add-Content -LiteralPath $env:GITHUB_ENV -Value "CPLUS_INCLUDE_PATH=$includePath"
+            Write-Host "Added include roots $includePath"
+          }
+
           Add-Content -LiteralPath $env:GITHUB_ENV -Value "FLUTZ_GNU_TOOL_ROOT=$selectedToolRoot"
           Add-Content -LiteralPath $env:GITHUB_ENV -Value "FLUTZ_GNU_SHELL_ROOT=$selectedShellRoot"
           Add-Content -LiteralPath $env:GITHUB_PATH -Value $selectedToolRoot
