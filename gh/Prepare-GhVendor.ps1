@@ -6,8 +6,10 @@ $VendorRoot = Join-Path $RepoRoot "vendor"
 $Sdl3Root = Join-Path $VendorRoot "SDL3"
 $JemallocRoot = Join-Path $VendorRoot "tikv-jemalloc-sys"
 $Sdl3SysVersion = "0.6.2+SDL-3.4.4"
+$Sdl3SrcVersion = "3.4.4"
 $JemallocVersion = "0.6.1"
 $Sdl3SysDestination = Join-Path $Sdl3Root "sdl3-sys-0.6.2+SDL-3.4.4-spacefix"
+$Sdl3SrcDestination = Join-Path $Sdl3Root "sdl3-src-3.4.4"
 
 function Ensure-Directory {
     param([Parameter(Mandatory = $true)][string]$Path)
@@ -84,6 +86,7 @@ publish = false
 
 [dependencies]
 sdl3-sys = "=$Sdl3SysVersion"
+sdl3-src = "=$Sdl3SrcVersion"
 tikv-jemalloc-sys = "=$JemallocVersion"
 "@
     Set-Content -LiteralPath $mainPath -Value "fn main() {}"
@@ -179,6 +182,39 @@ function Patch-JemallocBuildScript {
     [System.IO.File]::WriteAllText($buildScriptPath, $buildScript)
 }
 
+function Patch-Sdl3SysManifest {
+    param(
+        [Parameter(Mandatory = $true)][string]$Sdl3SysRoot,
+        [Parameter(Mandatory = $true)][string]$Sdl3SrcRoot
+    )
+
+    $manifestPath = Join-Path $Sdl3SysRoot "Cargo.toml"
+    if (-not (Test-Path -LiteralPath $manifestPath)) {
+        throw "Expected sdl3-sys Cargo.toml not found: $manifestPath"
+    }
+
+    $manifest = [System.IO.File]::ReadAllText($manifestPath)
+    $sdl3SrcPathToml = ($Sdl3SrcRoot -replace '\\', '/')
+
+    $replacement = @"
+[build-dependencies.sdl3-src]
+path = "$sdl3SrcPathToml"
+optional = true
+"@
+
+    $updated = [regex]::Replace(
+        $manifest,
+        '(?ms)^\[build-dependencies\.sdl3-src\]\r?\n.*?(?=^\[|\z)',
+        "$replacement`r`n"
+    )
+
+    if ($updated -eq $manifest) {
+        throw 'Failed to patch sdl3-sys Cargo.toml to use vendored sdl3-src path.'
+    }
+
+    [System.IO.File]::WriteAllText($manifestPath, $updated)
+}
+
 function Copy-CrateSource {
     param(
         [Parameter(Mandatory = $true)][string]$CrateName,
@@ -221,6 +257,10 @@ function Copy-CrateSource {
 
 if ((Test-Path -LiteralPath (Join-Path $Sdl3SysDestination "Cargo.toml")) -and (Test-Path -LiteralPath (Join-Path $JemallocRoot "Cargo.toml"))) {
     Write-Host "Using existing vendored SDL3 source: $Sdl3SysDestination"
+    if (-not (Test-Path -LiteralPath (Join-Path $Sdl3SrcDestination "Cargo.toml"))) {
+        Copy-CrateSource -CrateName 'sdl3-src' -Version $Sdl3SrcVersion -DestinationPath $Sdl3SrcDestination
+    }
+    Patch-Sdl3SysManifest -Sdl3SysRoot $Sdl3SysDestination -Sdl3SrcRoot $Sdl3SrcDestination
     exit 0
 }
 
@@ -229,10 +269,13 @@ Ensure-Directory -Path $Sdl3Root
 Ensure-Directory -Path $JemallocRoot
 
 Copy-CrateSource -CrateName 'sdl3-sys' -Version $Sdl3SysVersion -DestinationPath $Sdl3SysDestination
+Copy-CrateSource -CrateName 'sdl3-src' -Version $Sdl3SrcVersion -DestinationPath $Sdl3SrcDestination
 Copy-CrateSource -CrateName 'tikv-jemalloc-sys' -Version $JemallocVersion -DestinationPath $JemallocRoot
+Patch-Sdl3SysManifest -Sdl3SysRoot $Sdl3SysDestination -Sdl3SrcRoot $Sdl3SrcDestination
 
 foreach ($requiredPath in @(
     (Join-Path $Sdl3SysDestination 'Cargo.toml'),
+    (Join-Path $Sdl3SrcDestination 'Cargo.toml'),
     (Join-Path $JemallocRoot 'Cargo.toml'),
     (Join-Path $JemallocRoot 'build.rs')
 )) {
