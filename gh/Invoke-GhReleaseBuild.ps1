@@ -84,14 +84,14 @@ try {
     $hasSoundfonts = -not [string]::IsNullOrWhiteSpace($env:FLUTZ_SOUNDFONT_URL)
     $soundfontDir = Join-Path $RepoRoot "soundfonts"
 
-    if ($hasSoundfonts) {
-        Write-Host "Acquiring soundfont assets"
-        & $GhSoundfontScript -DestinationDirectory $soundfontDir
-        if ($LASTEXITCODE -ne 0) {
-            throw "Get-GhSoundfonts.ps1 failed with exit code $LASTEXITCODE"
-        }
-    } else {
-        Write-Host "FLUTZ_SOUNDFONT_URL not set; skipping soundfont download and DAT packing (binary-only build)"
+    if (-not $hasSoundfonts) {
+        throw "FLUTZ_SOUNDFONT_URL environment variable is not set. DAT files are required for release builds. Please configure the FLUTZ_SOUNDFONT_URL secret in GitHub Actions settings."
+    }
+
+    Write-Host "Acquiring soundfont assets from FLUTZ_SOUNDFONT_URL"
+    & $GhSoundfontScript -DestinationDirectory $soundfontDir
+    if ($LASTEXITCODE -ne 0) {
+        throw "Get-GhSoundfonts.ps1 failed with exit code $LASTEXITCODE"
     }
 
     if (Test-Path -LiteralPath $DropRoot) {
@@ -143,12 +143,13 @@ try {
     Copy-Item -Force -LiteralPath $DatManifest -Destination (Join-Path $DropDatPacker "dat-manifest.toml")
 
     $generatedDatFiles = @(Get-ChildItem -LiteralPath $GeneratedDatRoot -Filter "*.dat" -File -ErrorAction SilentlyContinue)
-    if ($generatedDatFiles.Count -eq 0 -and $hasSoundfonts) {
-        throw "No DAT files generated in $GeneratedDatRoot"
+    if ($generatedDatFiles.Count -eq 0) {
+        throw "No DAT files were generated. The soundfont packing step did not complete successfully. Check DAT manifest configuration and soundfont availability."
     }
     foreach ($datFile in $generatedDatFiles) {
         Copy-Item -Force -LiteralPath $datFile.FullName -Destination (Join-Path $DropData $datFile.Name)
     }
+    Write-Host "Copied $($generatedDatFiles.Count) DAT file(s) to release drop"
 
     $stagedSdlDlls = @(Get-ChildItem -Path $DropRoot -Filter "SDL3.dll" -File -Recurse -ErrorAction SilentlyContinue)
     if ($stagedSdlDlls.Count -gt 0) {
