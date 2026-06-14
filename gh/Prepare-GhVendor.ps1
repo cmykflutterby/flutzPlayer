@@ -26,13 +26,23 @@ function Resolve-CargoExecutable {
 function Resolve-ToolExecutable {
     param(
         [Parameter(Mandatory = $true)][string[]]$Names,
-        [Parameter(Mandatory = $true)][string]$ToolDescription
+        [Parameter(Mandatory = $true)][string]$ToolDescription,
+        [string]$PreferredRoot
     )
 
+    if (-not [string]::IsNullOrWhiteSpace($PreferredRoot) -and (Test-Path -LiteralPath $PreferredRoot)) {
+        foreach ($name in $Names) {
+            $preferredCandidate = Join-Path $PreferredRoot $name
+            if (Test-Path -LiteralPath $preferredCandidate) {
+                return $preferredCandidate
+            }
+        }
+    }
+
     foreach ($name in $Names) {
-        $command = Get-Command $name -CommandType Application -ErrorAction SilentlyContinue
-        if ($null -ne $command) {
-            return $command.Source
+        $command = @(Get-Command $name -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1)
+        if ($command.Count -gt 0) {
+            return $command[0].Source
         }
     }
 
@@ -241,8 +251,9 @@ $cargoConfigDir = Join-Path $RepoRoot '.cargo'
 $cargoConfigPath = Join-Path $cargoConfigDir 'config.toml'
 Ensure-Directory -Path $cargoConfigDir
 
-$shellPath = Resolve-ToolExecutable -Names @('sh.exe', 'bash.exe', 'sh', 'bash') -ToolDescription 'a POSIX shell (sh.exe or bash.exe)'
-$linkerPath = Resolve-ToolExecutable -Names @('gcc.exe', 'x86_64-w64-mingw32-gcc.exe', 'gcc') -ToolDescription 'a GNU C compiler (gcc.exe)'
+$toolRoot = $env:FLUTZ_GNU_TOOL_ROOT
+$shellPath = Resolve-ToolExecutable -Names @('sh.exe', 'bash.exe', 'sh', 'bash') -ToolDescription 'a POSIX shell (sh.exe or bash.exe)' -PreferredRoot $toolRoot
+$linkerPath = Resolve-ToolExecutable -Names @('gcc.exe', 'x86_64-w64-mingw32-gcc.exe', 'gcc') -ToolDescription 'a GNU C compiler (gcc.exe)' -PreferredRoot $toolRoot
 
 # Forward slashes are required in TOML strings passed to cargo
 $linkerPathToml = $linkerPath -replace '\\', '/'

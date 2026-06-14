@@ -46,6 +46,7 @@ jobs:
             throw "Could not locate an MSYS2 MinGW/UCRT/Clang bin directory. Checked: $($candidateRoots -join ', ')"
           }
 
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "FLUTZ_GNU_TOOL_ROOT=$selectedRoot"
           Add-Content -LiteralPath $env:GITHUB_PATH -Value $selectedRoot
           Write-Host "Added $selectedRoot to GITHUB_PATH"
 
