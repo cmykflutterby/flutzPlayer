@@ -1,7 +1,10 @@
 [package]
-name = "flutz_app"
+name = "flutzplayer"
 version = "0.1.0"
 edition.workspace = true
+
+[lib]
+name = "flutz_app"
 
 [dependencies]
 flutz_audio_sdl3 = { path = "../flutz_audio_sdl3" }
@@ -9,7 +12,9 @@ flutz_audio_wasapi = { path = "../flutz_audio_wasapi" }
 flutz_core = { path = "../flutz_core" }
 flutz_dat = { path = "../flutz_dat" }
 flutz_fmid = { path = "../flutz_fmid" }
+flutz_formats = { path = "../flutz_formats" }
 flutz_mixer = { path = "../flutz_mixer" }
+flutz_peq = { path = "../flutz_peq" }
 flutz_synth = { path = "../flutz_synth" }
 flutz_visualizer_core = { path = "../flutz_visualizer_core" }
 flutz_visualizer_egui = { path = "../flutz_visualizer_egui" }

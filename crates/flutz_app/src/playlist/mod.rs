@@ -173,7 +173,10 @@ impl PlaylistState {
     }
 
     pub fn move_entry(&mut self, from_index: usize, to_index: usize) {
-        if from_index >= self.entries.len() || to_index >= self.entries.len() || from_index == to_index {
+        if from_index >= self.entries.len()
+            || to_index >= self.entries.len()
+            || from_index == to_index
+        {
             return;
         }
 
@@ -294,10 +297,9 @@ impl PlaylistState {
         F: FnMut(&PlaylistEntry) -> bool,
     {
         match self.order_mode {
-            PlaylistOrderMode::Sequential => self.next_valid_track_by(
-                self.repeat_mode == PlaylistRepeatMode::Playlist,
-                is_valid,
-            ),
+            PlaylistOrderMode::Sequential => {
+                self.next_valid_track_by(self.repeat_mode == PlaylistRepeatMode::Playlist, is_valid)
+            }
             PlaylistOrderMode::Shuffle => self.next_shuffle_track_by(is_valid),
             PlaylistOrderMode::Random => self.next_random_track_by(is_valid),
         }
@@ -307,7 +309,10 @@ impl PlaylistState {
     where
         F: FnMut(&PlaylistEntry) -> bool,
     {
-        if matches!(self.order_mode, PlaylistOrderMode::Shuffle | PlaylistOrderMode::Random) {
+        if matches!(
+            self.order_mode,
+            PlaylistOrderMode::Shuffle | PlaylistOrderMode::Random
+        ) {
             return self.pop_previous_history().filter(|index| {
                 let entry = &mut self.entries[*index];
                 entry.refresh_status();

@@ -51,8 +51,28 @@ pub enum MixerSourceMode {
 pub struct ProjectRecord {
     pub project_name: String,
     pub source_midi_filename: String,
+    pub artist: String,
+    pub album: String,
+    pub album_artist: String,
+    pub composer: String,
+    pub conductor: String,
+    pub genre: String,
+    pub date: String,
+    pub track_number: String,
+    pub track_total: String,
+    pub disc_number: String,
+    pub disc_total: String,
+    pub description: String,
+    pub copyright: String,
+    pub publisher: String,
+    pub encoded_by: String,
+    pub encoder: String,
+    pub language: String,
+    pub lyrics: String,
+    pub url: String,
     pub project_flags: u64,
     pub notes: String,
+    pub extra_fields: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

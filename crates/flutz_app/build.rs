@@ -15,6 +15,7 @@ fn compile_windows_icon() -> Result<(), Box<dyn std::error::Error>> {
     let icon_png = manifest_dir.join("../../assets/flutzplayer-icon.png");
     let out_dir = PathBuf::from(env::var("OUT_DIR")?);
     let icon_ico = out_dir.join("flutzplayer-icon.ico");
+    let package_version = env::var("CARGO_PKG_VERSION")?;
 
     let image = image::open(&icon_png)?.into_rgba8();
     let (width, height) = image.dimensions();
@@ -26,6 +27,11 @@ fn compile_windows_icon() -> Result<(), Box<dyn std::error::Error>> {
 
     winresource::WindowsResource::new()
         .set_icon(icon_ico.to_string_lossy().as_ref())
+        .set("FileDescription", "flutzPlayer")
+        .set("ProductName", "flutzPlayer")
+        .set("InternalName", "flutzPlayer")
+        .set("OriginalFilename", "flutzPlayer.exe")
+        .set("ProductVersion", &package_version)
         .compile()?;
 
     Ok(())

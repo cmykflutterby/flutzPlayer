@@ -46,12 +46,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         transport.duration_seconds,
     );
     print_midi_scan(&scan);
-    print_event_summaries(
-        &midi_file.get_event_summaries_in_tick_range(
-            args.start_tick.saturating_sub(args.event_context_ticks),
-            args.end_tick.saturating_add(args.event_context_ticks),
-        ),
-    );
+    print_event_summaries(&midi_file.get_event_summaries_in_tick_range(
+        args.start_tick.saturating_sub(args.event_context_ticks),
+        args.end_tick.saturating_add(args.event_context_ticks),
+    ));
 
     if args.audio_ms > 0 {
         match playback.play()? {
@@ -125,8 +123,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if stalled_iterations >= 256 {
                 println!(
                     "{{\"event\":\"render_window_probe_stalled\",\"tick\":{},\"iterations\":{}}}",
-                    tick_after,
-                    stalled_iterations,
+                    tick_after, stalled_iterations,
                 );
                 break;
             }
@@ -322,7 +319,8 @@ struct ProbeSummary {
 }
 
 fn next_arg(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, String> {
-    args.next().ok_or_else(|| format!("{flag} requires a value"))
+    args.next()
+        .ok_or_else(|| format!("{flag} requires a value"))
 }
 
 fn soundfont_catalog(
@@ -342,11 +340,8 @@ fn load_input(
         Some(ext) if ext.eq_ignore_ascii_case("fmid") => load_fmid(playback, input),
         _ => {
             let midi_bytes = fs::read(input)?;
-            let load_message = playback.load_midi_bytes(
-                midi_bytes.clone(),
-                input.display().to_string(),
-                &[],
-            )?;
+            let load_message =
+                playback.load_midi_bytes(midi_bytes.clone(), input.display().to_string(), &[])?;
             Ok(LoadedInput {
                 load_message,
                 midi_bytes,
@@ -393,8 +388,10 @@ fn requested_soundfonts(fmid: &FmidFile) -> Vec<String> {
 
 fn playback_loop_settings(fmid: &FmidFile) -> PlaybackLoopSettings {
     let mut settings = PlaybackLoopSettings::default();
-    settings.enabled = matches!(fmid.looping.mode, FmidLoopMode::Infinite | FmidLoopMode::Counted)
-        && fmid.looping.enabled
+    settings.enabled = matches!(
+        fmid.looping.mode,
+        FmidLoopMode::Infinite | FmidLoopMode::Counted
+    ) && fmid.looping.enabled
         && fmid.looping.end_tick > fmid.looping.start_tick;
     settings.start_tick = fmid.looping.start_tick;
     settings.end_tick = fmid.looping.end_tick;
@@ -435,7 +432,12 @@ fn top_strips(strips: &[RealtimeStripSnapshot], limit: usize) -> Vec<StripSummar
             .rms
             .partial_cmp(&left.rms)
             .unwrap_or(Ordering::Equal)
-            .then_with(|| right.peak.partial_cmp(&left.peak).unwrap_or(Ordering::Equal))
+            .then_with(|| {
+                right
+                    .peak
+                    .partial_cmp(&left.peak)
+                    .unwrap_or(Ordering::Equal)
+            })
     });
     summaries.truncate(limit);
     summaries
@@ -483,7 +485,12 @@ fn top_stems(stems: &[StemRenderBlock], limit: usize) -> Vec<StemSummary> {
             .rms
             .partial_cmp(&left.rms)
             .unwrap_or(Ordering::Equal)
-            .then_with(|| right.peak.partial_cmp(&left.peak).unwrap_or(Ordering::Equal))
+            .then_with(|| {
+                right
+                    .peak
+                    .partial_cmp(&left.peak)
+                    .unwrap_or(Ordering::Equal)
+            })
     });
     summaries.truncate(limit);
     summaries
@@ -639,7 +646,14 @@ fn summarize(
         .collect::<Vec<_>>();
     let window_records = records
         .iter()
-        .filter(|record| overlaps(record.tick_before, record.tick_after, analysis_start, analysis_end))
+        .filter(|record| {
+            overlaps(
+                record.tick_before,
+                record.tick_after,
+                analysis_start,
+                analysis_end,
+            )
+        })
         .collect::<Vec<_>>();
 
     let baseline_rms = baseline_records
@@ -653,7 +667,11 @@ fn summarize(
 
     let min_record = window_records
         .iter()
-        .min_by(|left, right| left.output_rms.partial_cmp(&right.output_rms).unwrap_or(Ordering::Equal))
+        .min_by(|left, right| {
+            left.output_rms
+                .partial_cmp(&right.output_rms)
+                .unwrap_or(Ordering::Equal)
+        })
         .copied();
 
     let mut largest_drop_ratio = 0.0f32;
@@ -662,7 +680,12 @@ fn summarize(
     for pair in records.windows(2) {
         let previous = &pair[0];
         let current = &pair[1];
-        if !overlaps(current.tick_before, current.tick_after, analysis_start, analysis_end) {
+        if !overlaps(
+            current.tick_before,
+            current.tick_after,
+            analysis_start,
+            analysis_end,
+        ) {
             continue;
         }
         if previous.output_rms <= 0.0 {
@@ -692,10 +715,18 @@ fn summarize(
         record_count: records.len(),
         baseline_rms,
         baseline_peak,
-        window_min_rms: min_record.map(|record| record.output_rms).unwrap_or_default(),
-        window_min_peak: min_record.map(|record| record.output_peak).unwrap_or_default(),
-        min_rms_tick_before: min_record.map(|record| record.tick_before).unwrap_or_default(),
-        min_rms_tick_after: min_record.map(|record| record.tick_after).unwrap_or_default(),
+        window_min_rms: min_record
+            .map(|record| record.output_rms)
+            .unwrap_or_default(),
+        window_min_peak: min_record
+            .map(|record| record.output_peak)
+            .unwrap_or_default(),
+        min_rms_tick_before: min_record
+            .map(|record| record.tick_before)
+            .unwrap_or_default(),
+        min_rms_tick_after: min_record
+            .map(|record| record.tick_after)
+            .unwrap_or_default(),
         largest_drop_ratio,
         largest_drop_from_tick,
         largest_drop_to_tick,
@@ -715,8 +746,7 @@ fn diagnose_cause(
     let volume_events = nearby_events
         .iter()
         .filter(|event| {
-            event.kind == "control-change"
-                && matches!(event.data1, Some(7 | 11 | 120 | 121 | 123))
+            event.kind == "control-change" && matches!(event.data1, Some(7 | 11 | 120 | 121 | 123))
         })
         .count();
     if volume_events > 0 {
@@ -726,7 +756,8 @@ fn diagnose_cause(
         );
     }
     if scan.sysex_event_count > 0 {
-        return "possible MIDI/system-mode event influence; inspect nearby SysEx summaries".to_owned();
+        return "possible MIDI/system-mode event influence; inspect nearby SysEx summaries"
+            .to_owned();
     }
     if let Some(record) = min_record {
         if baseline_rms > 0.0

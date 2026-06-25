@@ -238,12 +238,82 @@ fn read_blob(bytes: &[u8]) -> Result<Vec<u8>> {
 
 fn read_project(bytes: &[u8]) -> Result<ProjectRecord> {
     let mut cursor = Cursor::new(bytes);
-    Ok(ProjectRecord {
-        project_name: read_utf8_cursor(&mut cursor, bytes)?,
-        source_midi_filename: read_utf8_cursor(&mut cursor, bytes)?,
-        project_flags: read_u64(&mut cursor)?,
-        notes: read_utf8_cursor(&mut cursor, bytes)?,
-    })
+    let project_name = read_utf8_cursor(&mut cursor, bytes)?;
+    let source_midi_filename = read_utf8_cursor(&mut cursor, bytes)?;
+    let mut new_cursor = cursor.clone();
+    let new_format = (|| -> Result<ProjectRecord> {
+        let artist = read_utf8_cursor(&mut new_cursor, bytes)?;
+        let album = read_utf8_cursor(&mut new_cursor, bytes)?;
+        let album_artist = read_utf8_cursor(&mut new_cursor, bytes)?;
+        let composer = read_utf8_cursor(&mut new_cursor, bytes)?;
+        let conductor = read_utf8_cursor(&mut new_cursor, bytes)?;
+        let genre = read_utf8_cursor(&mut new_cursor, bytes)?;
+        let date = read_utf8_cursor(&mut new_cursor, bytes)?;
+        let track_number = read_utf8_cursor(&mut new_cursor, bytes)?;
+        let track_total = read_utf8_cursor(&mut new_cursor, bytes)?;
+        let disc_number = read_utf8_cursor(&mut new_cursor, bytes)?;
+        let disc_total = read_utf8_cursor(&mut new_cursor, bytes)?;
+        let description = read_utf8_cursor(&mut new_cursor, bytes)?;
+        let copyright = read_utf8_cursor(&mut new_cursor, bytes)?;
+        let publisher = read_utf8_cursor(&mut new_cursor, bytes)?;
+        let encoded_by = read_utf8_cursor(&mut new_cursor, bytes)?;
+        let encoder = read_utf8_cursor(&mut new_cursor, bytes)?;
+        let language = read_utf8_cursor(&mut new_cursor, bytes)?;
+        let lyrics = read_utf8_cursor(&mut new_cursor, bytes)?;
+        let url = read_utf8_cursor(&mut new_cursor, bytes)?;
+        let project_flags = read_u64(&mut new_cursor)?;
+        let notes = read_utf8_cursor(&mut new_cursor, bytes)?;
+        let count = read_u64(&mut new_cursor)? as usize;
+        let mut extra_fields = Vec::with_capacity(count);
+        for _ in 0..count {
+            extra_fields.push((
+                read_utf8_cursor(&mut new_cursor, bytes)?,
+                read_utf8_cursor(&mut new_cursor, bytes)?,
+            ));
+        }
+        if (new_cursor.position() as usize) != bytes.len() {
+            return Err(FlutzError::InvalidInput(
+                "FMID project payload has trailing bytes".to_owned(),
+            ));
+        }
+        Ok(ProjectRecord {
+            project_name: project_name.clone(),
+            source_midi_filename: source_midi_filename.clone(),
+            artist,
+            album,
+            album_artist,
+            composer,
+            conductor,
+            genre,
+            date,
+            track_number,
+            track_total,
+            disc_number,
+            disc_total,
+            description,
+            copyright,
+            publisher,
+            encoded_by,
+            encoder,
+            language,
+            lyrics,
+            url,
+            project_flags,
+            notes,
+            extra_fields,
+        })
+    })();
+
+    match new_format {
+        Ok(project) => Ok(project),
+        Err(_) => Ok(ProjectRecord {
+            project_name,
+            source_midi_filename,
+            project_flags: read_u64(&mut cursor)?,
+            notes: read_utf8_cursor(&mut cursor, bytes)?,
+            ..ProjectRecord::default()
+        }),
+    }
 }
 
 fn read_soundfont_slots(bytes: &[u8]) -> Result<Vec<SoundFontSlot>> {

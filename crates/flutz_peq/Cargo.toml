@@ -1,0 +1,15 @@
+[package]
+name = "flutz_peq"
+version = "0.1.0"
+edition.workspace = true
+description = "Streaming parametric EQ primitives for flutzPlayer decoded-audio mastering."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+[dev-dependencies]
+serde_json = "1"
+
+[lints]
+workspace = true

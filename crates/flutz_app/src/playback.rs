@@ -9,9 +9,10 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
     },
-    time::Instant,
+    thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
 
 use flutz_audio_sdl3::{
@@ -30,14 +31,19 @@ use flutz_dat::{
     },
     soundfont_json::SoundFontIndexJson,
 };
+use flutz_formats::{
+    ContentKind, DecodedAudioBuffer, DecodedAudioStreamSession, DecodedAudioStreamSource,
+    MasteringCapability,
+};
 use flutz_mixer::{
     AudioBlockView, MeterReading, MixerEngine, MixerSettings, MixerStripControls,
     MixerStripIdentity, MixerStripInputView, StripMixReport,
 };
+use flutz_peq::{ChannelLayout, PeqConfig, PeqPresetFile, PeqProcessor, PreparedConfig};
 use flutz_synth::{
     LoadedMidi, LoadedSoundFont, MidiFileLoopType, MultiSoundFontPlayback, PlaybackConfig,
-    PlaybackLoopSettings, PlaybackMemoryDebug, PlaybackState, SoundFontBytes, SoundFontCoverage,
-    SoundFontRuntimeCache, SoundFontRuntimeCacheDebug, SoundFontSubsetBytes,
+    PlaybackLoopMode, PlaybackLoopSettings, PlaybackMemoryDebug, PlaybackState, SoundFontBytes,
+    SoundFontCoverage, SoundFontRuntimeCache, SoundFontRuntimeCacheDebug, SoundFontSubsetBytes,
     SoundFontSubsetSampleRange, StemIdentity, StemRenderAllocationDebug, StemRenderBlock,
 };
 use flutz_visualizer_core::{VisualizerAnalyzer, VisualizerAnalyzerConfig, VisualizerFrame};
@@ -426,6 +432,7 @@ pub struct PlaybackController {
     audio_config: AudioDeviceConfig,
     flux_guard: Mutex<FluxGuard>,
     audio_error: Option<String>,
+    decoded_audio: Option<Arc<Mutex<DecodedAudioPlaybackState>>>,
     loaded_midi: Option<PathBuf>,
     loaded_midi_bytes: Option<Vec<u8>>,
     loaded_soundfonts: Vec<String>,
@@ -480,6 +487,7 @@ impl PlaybackController {
             audio_config: AudioDeviceConfig::default(),
             flux_guard: Mutex::new(FluxGuard::default()),
             audio_error: None,
+            decoded_audio: None,
             loaded_midi: None,
             loaded_midi_bytes: None,
             loaded_soundfonts: Vec::new(),
@@ -563,7 +571,10 @@ impl PlaybackController {
                 detail: format!("recovered poisoned {lock_name} lock"),
                 backtrace: None,
                 frames_requested: 0,
-                midi_source: self.loaded_midi.as_ref().map(|path| path.display().to_string()),
+                midi_source: self
+                    .loaded_midi
+                    .as_ref()
+                    .map(|path| path.display().to_string()),
                 soundfont_ids: self.loaded_soundfonts.clone(),
                 midi_scan: self.last_midi_scan.clone(),
             },
@@ -606,12 +617,9 @@ impl PlaybackController {
     }
 
     pub fn playback_memory_debug(&self) -> Option<PlaybackMemoryDebug> {
-        self.engine.as_ref().and_then(|engine| {
-            engine
-                .lock()
-                .ok()
-                .map(|engine| engine.memory_debug())
-        })
+        self.engine
+            .as_ref()
+            .and_then(|engine| engine.lock().ok().map(|engine| engine.memory_debug()))
     }
 
     pub fn audible_output_view(&self) -> OutputViewSnapshot {
@@ -649,6 +657,12 @@ impl PlaybackController {
     }
 
     pub fn audible_transport_seconds(&self) -> f64 {
+        if let Some(decoded) = &self.decoded_audio {
+            return decoded
+                .lock()
+                .map(|decoded| decoded.position_seconds())
+                .unwrap_or(0.0);
+        }
         let Some(engine) = &self.engine else {
             return 0.0;
         };
@@ -694,6 +708,7 @@ impl PlaybackController {
         requested_soundfonts: &[String],
     ) -> Result<String> {
         let _allocation_scope = AllocationScopeGuard::enter(AllocationScope::PlaybackLoad);
+        self.decoded_audio = None;
         let scan = analyze_midi_file(&midi_bytes)?;
         let detected_loop_type = scan.detected_loop_type;
         self.last_demand_profile = scan.demand_profile.clone();
@@ -912,6 +927,188 @@ impl PlaybackController {
         Ok(summary)
     }
 
+    pub fn load_decoded_audio_buffer(
+        &mut self,
+        path: PathBuf,
+        format_id: impl Into<String>,
+        friendly_name: impl Into<String>,
+        buffer: DecodedAudioBuffer,
+        peq: Option<PeqPresetFile>,
+    ) -> Result<String> {
+        let _allocation_scope = AllocationScopeGuard::enter(AllocationScope::PlaybackLoad);
+        if buffer.summary.channels == 0 || buffer.summary.sample_rate == 0 {
+            return Err(FlutzError::UnsupportedFormat(
+                "decoded audio stream has no usable sample rate or channel layout".to_owned(),
+            ));
+        }
+        if let Some(audio) = &mut self.audio {
+            if let Err(error) = audio.pause() {
+                self.audio_error = Some(format!("audio pause failed: {error}"));
+            }
+        }
+        self.audio = None;
+        self.audio_error = None;
+        self.engine = None;
+        self.loaded_midi = None;
+        self.loaded_midi_bytes = None;
+        self.loaded_soundfonts.clear();
+        self.loaded_coverages.clear();
+        self.loaded_subset_state.clear();
+        self.last_subset_plans.clear();
+        self.subset_transition = PlaybackSubsetTransitionDiagnostics::default();
+        self.midi_transport = MidiTransportMetadata::default();
+        if let Ok(mut midi_strips) = self.midi_strips.lock() {
+            midi_strips.clear();
+        }
+
+        self.audio_config = AudioDeviceConfig {
+            sample_rate: buffer.summary.sample_rate,
+            channels: 2,
+            internal_block_frames: PlaybackConfig::default().block_frames as u16,
+            ..AudioDeviceConfig::default()
+        };
+        if let Ok(mut analyzer) = self.visualizer_analyzer.lock() {
+            *analyzer = VisualizerAnalyzer::new(VisualizerAnalyzerConfig::with_sample_rate(
+                self.audio_config.sample_rate,
+            ));
+        }
+
+        let metadata = DecodedAudioTransportMetadata {
+            path,
+            format_id: format_id.into(),
+            friendly_name: friendly_name.into(),
+            sample_rate: buffer.summary.sample_rate,
+            channels: buffer.summary.channels,
+            frame_length: buffer.summary.frames_decoded,
+            duration_seconds: if buffer.summary.sample_rate == 0 {
+                0.0
+            } else {
+                buffer.summary.frames_decoded as f64 / buffer.summary.sample_rate as f64
+            },
+            content_kind: ContentKind::DecodedAudio,
+            mastering: MasteringCapability::DecodedAudioPeq,
+        };
+        let summary = format!(
+            "Loaded {} decoded audio, {:.2}s, {} Hz, {} channel(s)",
+            metadata.friendly_name,
+            metadata.duration_seconds,
+            metadata.sample_rate,
+            metadata.channels,
+        );
+        self.decoded_audio = Some(Arc::new(Mutex::new(DecodedAudioPlaybackState::new(
+            metadata,
+            buffer.samples,
+            peq,
+            PlaybackConfig::default().block_frames,
+        )?)));
+        self.mixer
+            .lock()
+            .map_err(|_| FlutzError::Runtime("mixer lock is poisoned".to_owned()))?
+            .reset_state_and_release_scratch();
+        if let Ok(mut snapshot_history) = self.latest_snapshot.lock() {
+            snapshot_history.clear();
+        }
+        self.reset_visualizer_to_silence();
+        self.rendered_frame_clock.store(0, Ordering::Relaxed);
+        self.reset_flux_guard();
+        memory_runtime::decay_idle_reuse_preserving(false);
+        Ok(summary)
+    }
+
+    pub fn load_decoded_audio_stream(
+        &mut self,
+        path: PathBuf,
+        format_id: impl Into<String>,
+        friendly_name: impl Into<String>,
+        source: DecodedAudioStreamSource,
+        peq: Option<PeqPresetFile>,
+    ) -> Result<String> {
+        let _allocation_scope = AllocationScopeGuard::enter(AllocationScope::PlaybackLoad);
+        let format_id = format_id.into();
+        let friendly_name = friendly_name.into();
+        let session = DecodedAudioStreamSession::open(source, &format_id, Default::default())?;
+        let stream_metadata = session.metadata().clone();
+        if stream_metadata.channels == 0 || stream_metadata.sample_rate == 0 {
+            return Err(FlutzError::UnsupportedFormat(
+                "decoded audio stream has no usable sample rate or channel layout".to_owned(),
+            ));
+        }
+        if let Some(audio) = &mut self.audio {
+            if let Err(error) = audio.pause() {
+                self.audio_error = Some(format!("audio pause failed: {error}"));
+            }
+        }
+        self.audio = None;
+        self.audio_error = None;
+        self.engine = None;
+        self.loaded_midi = None;
+        self.loaded_midi_bytes = None;
+        self.loaded_soundfonts.clear();
+        self.loaded_coverages.clear();
+        self.loaded_subset_state.clear();
+        self.last_subset_plans.clear();
+        self.subset_transition = PlaybackSubsetTransitionDiagnostics::default();
+        self.midi_transport = MidiTransportMetadata::default();
+        if let Ok(mut midi_strips) = self.midi_strips.lock() {
+            midi_strips.clear();
+        }
+
+        self.audio_config = AudioDeviceConfig {
+            sample_rate: stream_metadata.sample_rate,
+            channels: 2,
+            internal_block_frames: PlaybackConfig::default().block_frames as u16,
+            ..AudioDeviceConfig::default()
+        };
+        if let Ok(mut analyzer) = self.visualizer_analyzer.lock() {
+            *analyzer = VisualizerAnalyzer::new(VisualizerAnalyzerConfig::with_sample_rate(
+                self.audio_config.sample_rate,
+            ));
+        }
+
+        let frame_length = stream_metadata.frame_length.unwrap_or(0);
+        let duration_seconds = stream_metadata
+            .duration_seconds
+            .unwrap_or_else(|| frame_length as f64 / stream_metadata.sample_rate.max(1) as f64);
+        let metadata = DecodedAudioTransportMetadata {
+            path,
+            format_id,
+            friendly_name,
+            sample_rate: stream_metadata.sample_rate,
+            channels: stream_metadata.channels,
+            frame_length,
+            duration_seconds,
+            content_kind: ContentKind::DecodedAudio,
+            mastering: MasteringCapability::DecodedAudioPeq,
+        };
+        let summary = format!(
+            "Loaded {} decoded audio stream, {:.2}s, {} Hz, {} channel(s)",
+            metadata.friendly_name,
+            metadata.duration_seconds,
+            metadata.sample_rate,
+            metadata.channels,
+        );
+        self.decoded_audio = Some(Arc::new(Mutex::new(
+            DecodedAudioPlaybackState::new_streaming(
+                metadata,
+                session,
+                peq,
+                PlaybackConfig::default().block_frames,
+            )?,
+        )));
+        self.mixer
+            .lock()
+            .map_err(|_| FlutzError::Runtime("mixer lock is poisoned".to_owned()))?
+            .reset_state_and_release_scratch();
+        if let Ok(mut snapshot_history) = self.latest_snapshot.lock() {
+            snapshot_history.clear();
+        }
+        self.reset_visualizer_to_silence();
+        self.rendered_frame_clock.store(0, Ordering::Relaxed);
+        self.reset_flux_guard();
+        memory_runtime::decay_idle_reuse_preserving(false);
+        Ok(summary)
+    }
+
     fn soundfont_demand_diagnostics(
         &self,
         requested_soundfonts: &[String],
@@ -947,6 +1144,36 @@ impl PlaybackController {
     }
 
     pub fn play(&mut self) -> Result<AudioPlaybackStatus> {
+        if let Some(decoded) = self.decoded_audio.as_ref().map(Arc::clone) {
+            {
+                let mut decoded = decoded.lock().map_err(|_| {
+                    FlutzError::Runtime("decoded audio lock is poisoned".to_owned())
+                })?;
+                decoded.play();
+            }
+            if let Err(error) = self.ensure_audio_stream() {
+                let message = format!("audio unavailable: {error}");
+                self.audio_error = Some(message.clone());
+                if let Ok(mut decoded) = decoded.lock() {
+                    decoded.pause();
+                }
+                return Ok(AudioPlaybackStatus::AudioUnavailable(message));
+            }
+            if let Some(audio) = &mut self.audio {
+                if let Err(error) = audio.resume() {
+                    self.audio = None;
+                    let message = format!("audio resume failed: {error}");
+                    self.audio_error = Some(message.clone());
+                    if let Ok(mut decoded) = decoded.lock() {
+                        decoded.pause();
+                    }
+                    return Ok(AudioPlaybackStatus::AudioUnavailable(message));
+                }
+            }
+            self.update_latency_control();
+            self.audio_error = None;
+            return Ok(AudioPlaybackStatus::Audible);
+        }
         let engine = self.engine.as_ref().ok_or_else(|| {
             FlutzError::InvalidInput("load a MIDI file before playing".to_owned())
         })?;
@@ -1143,6 +1370,12 @@ impl PlaybackController {
     }
 
     pub fn pause(&mut self) -> Result<()> {
+        if let Some(decoded) = &self.decoded_audio {
+            decoded
+                .lock()
+                .map_err(|_| FlutzError::Runtime("decoded audio lock is poisoned".to_owned()))?
+                .pause();
+        }
         if let Some(engine) = &self.engine {
             engine
                 .lock()
@@ -1170,6 +1403,12 @@ impl PlaybackController {
     }
 
     pub fn stop(&mut self) -> Result<()> {
+        if let Some(decoded) = &self.decoded_audio {
+            decoded
+                .lock()
+                .map_err(|_| FlutzError::Runtime("decoded audio lock is poisoned".to_owned()))?
+                .stop();
+        }
         if let Some(engine) = &self.engine {
             engine
                 .lock()
@@ -1201,6 +1440,7 @@ impl PlaybackController {
         self.audio = None;
         self.audio_error = None;
         self.engine = None;
+        self.decoded_audio = None;
         self.loaded_midi = None;
         self.loaded_midi_bytes = None;
         self.loaded_soundfonts.clear();
@@ -1242,6 +1482,20 @@ impl PlaybackController {
     }
 
     pub fn status_line(&self) -> String {
+        if let Some(decoded) = &self.decoded_audio {
+            return decoded
+                .lock()
+                .map(|decoded| {
+                    format!(
+                        "{}, {} Hz, {} channel(s), {}",
+                        decoded.metadata.friendly_name,
+                        decoded.metadata.sample_rate,
+                        decoded.metadata.channels,
+                        self.audio_status_text()
+                    )
+                })
+                .unwrap_or_else(|_| "decoded audio unavailable".to_owned());
+        }
         let Some(engine) = &self.engine else {
             return "no MIDI loaded".to_owned();
         };
@@ -1272,6 +1526,16 @@ impl PlaybackController {
     }
 
     pub fn debug_metrics(&self) -> PlaybackDebugMetrics {
+        let decoded_transport = self.decoded_audio.as_ref().and_then(|decoded| {
+            decoded.lock().ok().map(|decoded| {
+                (
+                    decoded.state_label().to_owned(),
+                    decoded.position_seconds(),
+                    decoded.position_frame,
+                    decoded.metadata.duration_seconds,
+                )
+            })
+        });
         let (engine_state, transport_seconds, transport_tick, memory_debug) = self
             .engine
             .as_ref()
@@ -1285,7 +1549,14 @@ impl PlaybackController {
                     )
                 })
             })
-            .unwrap_or_else(|| ("unloaded".to_owned(), 0.0, 0, None));
+            .unwrap_or_else(|| {
+                decoded_transport
+                    .as_ref()
+                    .map(|(state, seconds, frame, _duration)| {
+                        (state.clone(), *seconds, *frame, None)
+                    })
+                    .unwrap_or_else(|| ("unloaded".to_owned(), 0.0, 0, None))
+            });
         let audio_diagnostics = self.audio.as_ref().map(AudioOutput::diagnostics);
         let flux_guard = self.flux_guard_snapshot();
         let audible_output = self.audible_output_view();
@@ -1296,7 +1567,10 @@ impl PlaybackController {
         PlaybackDebugMetrics {
             engine_state,
             transport_seconds,
-            transport_duration_seconds: self.midi_transport.duration_seconds,
+            transport_duration_seconds: decoded_transport
+                .as_ref()
+                .map(|(_, _, _, duration)| *duration)
+                .unwrap_or(self.midi_transport.duration_seconds),
             transport_tick,
             loaded_soundfont_count: self.loaded_soundfonts.len(),
             requested_soundfont_count: self.last_soundfont_demand.requested_soundfont_count,
@@ -1411,7 +1685,13 @@ impl PlaybackController {
     }
 
     pub fn playback_active(&self) -> bool {
-        self.engine_state() == Some(PlaybackState::Playing)
+        if self.engine_state() == Some(PlaybackState::Playing) {
+            return true;
+        }
+        self.decoded_audio
+            .as_ref()
+            .and_then(|decoded| decoded.lock().ok().map(|decoded| decoded.is_playing()))
+            .unwrap_or(false)
     }
 
     fn capture_render_layer_transition(
@@ -1600,6 +1880,12 @@ impl PlaybackController {
     }
 
     pub fn transport_fraction(&self) -> f32 {
+        if let Some(decoded) = &self.decoded_audio {
+            return decoded
+                .lock()
+                .map(|decoded| decoded.transport_fraction())
+                .unwrap_or(0.0);
+        }
         let Some(engine) = &self.engine else {
             return 0.0;
         };
@@ -1614,6 +1900,12 @@ impl PlaybackController {
     }
 
     pub fn transport_tick(&self) -> u64 {
+        if let Some(decoded) = &self.decoded_audio {
+            return decoded
+                .lock()
+                .map(|decoded| decoded.position_frame)
+                .unwrap_or(0);
+        }
         let Some(engine) = &self.engine else {
             return 0;
         };
@@ -1624,6 +1916,15 @@ impl PlaybackController {
     }
 
     pub fn seek_transport_fraction(&mut self, fraction: f32) -> Result<()> {
+        if let Some(decoded) = &self.decoded_audio {
+            let was_playing = self.playback_active();
+            decoded
+                .lock()
+                .map_err(|_| FlutzError::Runtime("decoded audio lock is poisoned".to_owned()))?
+                .seek_fraction(fraction);
+            self.reset_audible_output_after_reposition(was_playing);
+            return Ok(());
+        }
         let Some(engine) = &self.engine else {
             return Ok(());
         };
@@ -1637,6 +1938,15 @@ impl PlaybackController {
     }
 
     pub fn seek_transport_tick(&mut self, tick: u64) -> Result<()> {
+        if let Some(decoded) = &self.decoded_audio {
+            let was_playing = self.playback_active();
+            decoded
+                .lock()
+                .map_err(|_| FlutzError::Runtime("decoded audio lock is poisoned".to_owned()))?
+                .seek_frame(tick);
+            self.reset_audible_output_after_reposition(was_playing);
+            return Ok(());
+        }
         let Some(engine) = &self.engine else {
             return Ok(());
         };
@@ -1650,6 +1960,15 @@ impl PlaybackController {
     }
 
     pub fn seek_transport_seconds(&mut self, seconds: f64) -> Result<()> {
+        if let Some(decoded) = &self.decoded_audio {
+            let was_playing = self.playback_active();
+            decoded
+                .lock()
+                .map_err(|_| FlutzError::Runtime("decoded audio lock is poisoned".to_owned()))?
+                .seek_seconds(seconds);
+            self.reset_audible_output_after_reposition(was_playing);
+            return Ok(());
+        }
         let Some(engine) = &self.engine else {
             return Ok(());
         };
@@ -1663,6 +1982,13 @@ impl PlaybackController {
     }
 
     pub fn set_loop_enabled(&mut self, enabled: bool) -> Result<()> {
+        if let Some(decoded) = &self.decoded_audio {
+            decoded
+                .lock()
+                .map_err(|_| FlutzError::Runtime("decoded audio lock is poisoned".to_owned()))?
+                .set_loop_enabled(enabled);
+            return Ok(());
+        }
         let Some(engine) = &self.engine else {
             return Ok(());
         };
@@ -1674,6 +2000,13 @@ impl PlaybackController {
     }
 
     pub fn set_loop_settings(&mut self, settings: PlaybackLoopSettings) -> Result<()> {
+        if let Some(decoded) = &self.decoded_audio {
+            decoded
+                .lock()
+                .map_err(|_| FlutzError::Runtime("decoded audio lock is poisoned".to_owned()))?
+                .set_loop_settings(settings);
+            return Ok(());
+        }
         let Some(engine) = &self.engine else {
             return Ok(());
         };
@@ -1686,6 +2019,82 @@ impl PlaybackController {
 
     pub fn midi_transport_metadata(&self) -> MidiTransportMetadata {
         self.midi_transport.clone()
+    }
+
+    pub fn decoded_transport_metadata(&self) -> Option<DecodedAudioTransportMetadata> {
+        self.decoded_audio
+            .as_ref()
+            .and_then(|decoded| decoded.lock().ok().map(|decoded| decoded.metadata.clone()))
+    }
+
+    pub fn decoded_stream_cache_debug(&self) -> Option<DecodedStreamCacheDebug> {
+        self.decoded_audio.as_ref().and_then(|decoded| {
+            decoded
+                .lock()
+                .ok()
+                .and_then(|decoded| decoded.stream_cache_debug())
+        })
+    }
+
+    pub fn wait_for_decoded_stream_cache(&self, timeout: Duration) -> bool {
+        self.decoded_audio
+            .as_ref()
+            .and_then(|decoded| {
+                decoded
+                    .lock()
+                    .ok()
+                    .map(|decoded| decoded.wait_for_stream_cache(timeout))
+            })
+            .unwrap_or(false)
+    }
+
+    pub fn set_decoded_peq_config(&mut self, config: PeqConfig) -> Result<u64> {
+        let prepared = PeqProcessor::prepare_config(config).map_err(|error| {
+            FlutzError::InvalidInput(format!("invalid decoded audio PEQ config: {error}"))
+        })?;
+        let decoded = self.decoded_audio.as_ref().ok_or_else(|| {
+            FlutzError::InvalidInput("load decoded audio before editing PEQ".to_owned())
+        })?;
+        decoded
+            .lock()
+            .map_err(|_| FlutzError::Runtime("decoded audio lock is poisoned".to_owned()))?
+            .set_peq_prepared_config(prepared)
+    }
+
+    pub fn decoded_render_probe(&mut self, frames: usize) -> Result<DecodedRenderProbeReport> {
+        let decoded = self.decoded_audio.as_ref().ok_or_else(|| {
+            FlutzError::InvalidInput("load decoded audio before probing render".to_owned())
+        })?;
+        let mut output = vec![0.0f32; frames.saturating_mul(2)];
+        let output_gain = self
+            .session_output_gain
+            .lock()
+            .map(|gain| *gain)
+            .unwrap_or(1.0);
+        let mut decoded = decoded
+            .lock()
+            .map_err(|_| FlutzError::Runtime("decoded audio lock is poisoned".to_owned()))?;
+        decoded.play();
+        let retained_before = decoded.retained_scratch_bytes();
+        let meter = render_decoded_audio_stereo(&mut decoded, &mut output, output_gain)?;
+        let retained_after = decoded.retained_scratch_bytes();
+        let peq_generation = decoded.peq_generation();
+        drop(decoded);
+        if let Ok(mut analyzer) = self.visualizer_analyzer.lock() {
+            let frame = analyzer.ingest_interleaved_stereo(
+                &output,
+                frames as f32 / self.audio_config.sample_rate.max(1) as f32,
+            );
+            self.record_analyzer_trace(&frame);
+        }
+        Ok(DecodedRenderProbeReport {
+            frames,
+            samples: output.len(),
+            peak: meter.peak,
+            rms: meter.rms,
+            peq_generation,
+            scratch_growth_bytes: retained_after.saturating_sub(retained_before),
+        })
     }
 
     pub fn loaded_midi(&self) -> Option<&Path> {
@@ -1724,6 +2133,63 @@ impl PlaybackController {
 
     fn ensure_audio_stream(&mut self) -> Result<()> {
         if self.audio.is_some() {
+            return Ok(());
+        }
+        if let Some(decoded) = &self.decoded_audio {
+            let audio_decoded = Arc::clone(decoded);
+            let audio_session_output_gain = Arc::clone(&self.session_output_gain);
+            let audio_snapshot = Arc::clone(&self.latest_snapshot);
+            let audio_visualizer = Arc::clone(&self.visualizer_analyzer);
+            let audio_analyzer_trace = self.analyzer_trace.as_ref().map(Arc::clone);
+            let audio_frame_clock = Arc::clone(&self.rendered_frame_clock);
+            let audio_backend = self.audio_backend;
+            let audio_sample_rate = self.audio_config.sample_rate;
+            let audio =
+                AudioOutput::open_f32_stream(audio_backend, self.audio_config, move |output| {
+                    let _allocation_scope =
+                        AllocationScopeGuard::enter(AllocationScope::AudioCallback);
+                    let output_gain = audio_session_output_gain
+                        .lock()
+                        .map(|gain| *gain)
+                        .unwrap_or(1.0);
+                    let meter = match audio_decoded.lock() {
+                        Ok(mut decoded) => {
+                            render_decoded_audio_stereo(&mut decoded, output, output_gain)
+                                .unwrap_or_else(|_| {
+                                    output.fill(0.0);
+                                    MeterReading::default()
+                                })
+                        }
+                        Err(_) => {
+                            output.fill(0.0);
+                            MeterReading::default()
+                        }
+                    };
+                    let rendered_frames = output.len() / 2;
+                    let rendered_frame_end = audio_frame_clock
+                        .fetch_add(rendered_frames as u64, Ordering::Relaxed)
+                        .saturating_add(rendered_frames as u64);
+                    if let Ok(mut snapshot_history) = audio_snapshot.lock() {
+                        snapshot_history.record(
+                            rendered_frame_end,
+                            RealtimeMixerSnapshot {
+                                output_meter: meter,
+                                strips: BTreeMap::new(),
+                            },
+                            audio_sample_rate,
+                        );
+                    }
+                    if let Ok(mut analyzer) = audio_visualizer.lock() {
+                        let frame = analyzer.ingest_interleaved_stereo(
+                            output,
+                            rendered_frames as f32 / audio_sample_rate.max(1) as f32,
+                        );
+                        record_analyzer_trace_arc(audio_analyzer_trace.as_ref(), &frame);
+                    }
+                })
+                .map_err(FlutzError::Runtime)?;
+            self.audio = Some(audio);
+            self.audio_error = None;
             return Ok(());
         }
         let engine = self.engine.as_ref().ok_or_else(|| {
@@ -2632,7 +3098,11 @@ impl RenderErrorTrace {
         })
     }
 
-    fn record_midi_scan(&mut self, midi_source: Option<&Path>, diagnostics: &PlaybackMidiScanDiagnostics) {
+    fn record_midi_scan(
+        &mut self,
+        midi_source: Option<&Path>,
+        diagnostics: &PlaybackMidiScanDiagnostics,
+    ) {
         self.sequence = self.sequence.saturating_add(1);
         let line = midi_scan_trace_json(self.sequence, midi_source, diagnostics);
         let _ = writeln!(self.writer, "{line}");
@@ -2722,6 +3192,613 @@ fn record_analyzer_trace_arc(trace: Option<&Arc<Mutex<AnalyzerTrace>>>, frame: &
 pub enum AudioPlaybackStatus {
     Audible,
     AudioUnavailable(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DecodedAudioTransportMetadata {
+    pub path: PathBuf,
+    pub format_id: String,
+    pub friendly_name: String,
+    pub sample_rate: u32,
+    pub channels: usize,
+    pub frame_length: u64,
+    pub duration_seconds: f64,
+    pub content_kind: ContentKind,
+    pub mastering: MasteringCapability,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DecodedRenderProbeReport {
+    pub frames: usize,
+    pub samples: usize,
+    pub peak: f32,
+    pub rms: f32,
+    pub peq_generation: u64,
+    pub scratch_growth_bytes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedStreamCacheDebug {
+    pub streaming: bool,
+    pub cache_start_frame: u64,
+    pub cache_frames: usize,
+    pub cache_capacity_frames: usize,
+    pub source_channels: usize,
+    pub cached_sample_capacity: usize,
+    pub full_sample_len: usize,
+    pub full_sample_capacity: usize,
+    pub request_generation: u64,
+    pub filled_generation: u64,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
+enum DecodedPlaybackState {
+    #[default]
+    Stopped,
+    Playing,
+    Paused,
+}
+
+const DECODED_STREAM_PLAYAHEAD_SECONDS: usize = 10;
+
+#[derive(Debug)]
+struct DecodedAudioPlaybackState {
+    metadata: DecodedAudioTransportMetadata,
+    samples: Option<Vec<f32>>,
+    stream: Option<DecodedStreamCache>,
+    peq: PeqProcessor,
+    peq_input: Vec<f32>,
+    position_frame: u64,
+    state: DecodedPlaybackState,
+    loop_settings: PlaybackLoopSettings,
+    counted_loops_remaining: u32,
+}
+
+#[derive(Debug)]
+struct DecodedStreamCache {
+    shared: Arc<(Mutex<DecodedStreamCacheShared>, Condvar)>,
+    worker: Option<JoinHandle<()>>,
+}
+
+#[derive(Debug)]
+struct DecodedStreamCacheShared {
+    cache_start_frame: u64,
+    cache_frames: usize,
+    cache_capacity_frames: usize,
+    source_channels: usize,
+    samples: Vec<f32>,
+    request_start_frame: u64,
+    request_generation: u64,
+    filled_generation: u64,
+    shutdown: bool,
+    last_error: Option<String>,
+}
+
+impl Drop for DecodedStreamCache {
+    fn drop(&mut self) {
+        let (lock, condvar) = &*self.shared;
+        if let Ok(mut shared) = lock.lock() {
+            shared.shutdown = true;
+            shared.request_generation = shared.request_generation.saturating_add(1);
+            condvar.notify_all();
+        }
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+impl DecodedAudioPlaybackState {
+    fn new(
+        metadata: DecodedAudioTransportMetadata,
+        samples: Vec<f32>,
+        peq: Option<PeqPresetFile>,
+        preallocated_frames: usize,
+    ) -> Result<Self> {
+        let peq_config = decoded_peq_config(peq, metadata.sample_rate, 2);
+        let peq = PeqProcessor::from_config(peq_config).map_err(|error| {
+            FlutzError::InvalidInput(format!("invalid decoded audio PEQ config: {error}"))
+        })?;
+        Ok(Self {
+            metadata,
+            samples: Some(samples),
+            stream: None,
+            peq,
+            peq_input: vec![0.0; preallocated_frames.saturating_mul(2)],
+            position_frame: 0,
+            state: DecodedPlaybackState::Stopped,
+            loop_settings: PlaybackLoopSettings::default(),
+            counted_loops_remaining: 0,
+        })
+    }
+
+    fn new_streaming(
+        metadata: DecodedAudioTransportMetadata,
+        session: DecodedAudioStreamSession,
+        peq: Option<PeqPresetFile>,
+        preallocated_frames: usize,
+    ) -> Result<Self> {
+        let peq_config = decoded_peq_config(peq, metadata.sample_rate, 2);
+        let peq = PeqProcessor::from_config(peq_config).map_err(|error| {
+            FlutzError::InvalidInput(format!("invalid decoded audio PEQ config: {error}"))
+        })?;
+        let source_channels = metadata.channels.max(1);
+        let cache_capacity_frames = (metadata.sample_rate as usize)
+            .saturating_mul(DECODED_STREAM_PLAYAHEAD_SECONDS)
+            .max(preallocated_frames.saturating_mul(4));
+        let shared = Arc::new((
+            Mutex::new(DecodedStreamCacheShared {
+                cache_start_frame: 0,
+                cache_frames: 0,
+                cache_capacity_frames,
+                source_channels,
+                samples: Vec::with_capacity(cache_capacity_frames.saturating_mul(source_channels)),
+                request_start_frame: 0,
+                request_generation: 1,
+                filled_generation: 0,
+                shutdown: false,
+                last_error: None,
+            }),
+            Condvar::new(),
+        ));
+        let worker_shared = Arc::clone(&shared);
+        let worker = thread::Builder::new()
+            .name("flutz-decoded-stream".to_owned())
+            .spawn(move || decoded_stream_worker(session, worker_shared))
+            .map_err(|error| {
+                FlutzError::Runtime(format!("failed to start decoded stream worker: {error}"))
+            })?;
+        Ok(Self {
+            metadata,
+            samples: None,
+            stream: Some(DecodedStreamCache {
+                shared,
+                worker: Some(worker),
+            }),
+            peq,
+            peq_input: vec![0.0; preallocated_frames.saturating_mul(2)],
+            position_frame: 0,
+            state: DecodedPlaybackState::Stopped,
+            loop_settings: PlaybackLoopSettings::default(),
+            counted_loops_remaining: 0,
+        })
+    }
+
+    fn play(&mut self) {
+        if self.position_frame >= self.metadata.frame_length {
+            self.position_frame = 0;
+        }
+        if matches!(self.state, DecodedPlaybackState::Stopped) {
+            self.counted_loops_remaining = self.loop_settings.loop_count.max(1);
+        }
+        self.request_stream_cache_fill(self.position_frame);
+        self.state = DecodedPlaybackState::Playing;
+    }
+
+    fn pause(&mut self) {
+        if matches!(self.state, DecodedPlaybackState::Playing) {
+            self.state = DecodedPlaybackState::Paused;
+        }
+    }
+
+    fn stop(&mut self) {
+        self.state = DecodedPlaybackState::Stopped;
+        self.position_frame = 0;
+        self.counted_loops_remaining = self.loop_settings.loop_count.max(1);
+    }
+
+    fn is_playing(&self) -> bool {
+        matches!(self.state, DecodedPlaybackState::Playing)
+    }
+
+    fn state_label(&self) -> &'static str {
+        match self.state {
+            DecodedPlaybackState::Stopped => "Stopped",
+            DecodedPlaybackState::Playing => "Playing",
+            DecodedPlaybackState::Paused => "Paused",
+        }
+    }
+
+    fn position_seconds(&self) -> f64 {
+        if self.metadata.sample_rate == 0 {
+            return 0.0;
+        }
+        self.position_frame as f64 / self.metadata.sample_rate as f64
+    }
+
+    fn transport_fraction(&self) -> f32 {
+        if self.metadata.frame_length == 0 {
+            return 0.0;
+        }
+        (self.position_frame as f64 / self.metadata.frame_length as f64).clamp(0.0, 1.0) as f32
+    }
+
+    fn seek_fraction(&mut self, fraction: f32) {
+        let target = (self.metadata.frame_length as f64 * f64::from(fraction.clamp(0.0, 1.0)))
+            .round() as u64;
+        self.seek_frame(target);
+    }
+
+    fn seek_seconds(&mut self, seconds: f64) {
+        let target = (seconds.max(0.0) * self.metadata.sample_rate.max(1) as f64).round() as u64;
+        self.seek_frame(target);
+    }
+
+    fn seek_frame(&mut self, frame: u64) {
+        self.position_frame = frame.min(self.metadata.frame_length);
+        self.counted_loops_remaining = self.loop_settings.loop_count.max(1);
+        self.request_stream_cache_fill(self.position_frame);
+    }
+
+    fn set_loop_enabled(&mut self, enabled: bool) {
+        self.loop_settings.enabled = enabled;
+        if enabled && matches!(self.loop_settings.mode, PlaybackLoopMode::None) {
+            self.loop_settings.mode = PlaybackLoopMode::Infinite;
+        }
+    }
+
+    fn set_loop_settings(&mut self, mut settings: PlaybackLoopSettings) {
+        settings.start_tick = settings.start_tick.min(self.metadata.frame_length);
+        settings.end_tick = settings.end_tick.min(self.metadata.frame_length);
+        settings.loop_count = settings.loop_count.max(1);
+        if settings.end_tick <= settings.start_tick {
+            settings.enabled = false;
+        }
+        self.loop_settings = settings;
+        self.counted_loops_remaining = self.loop_settings.loop_count;
+    }
+
+    fn next_source_frame(&mut self) -> Option<u64> {
+        if !self.is_playing() || self.metadata.frame_length == 0 {
+            return None;
+        }
+        if self.position_frame >= self.effective_play_end_frame() && !self.apply_loop_boundary() {
+            self.state = DecodedPlaybackState::Stopped;
+            return None;
+        }
+        let frame = self.position_frame;
+        self.position_frame = self.position_frame.saturating_add(1);
+        Some(frame)
+    }
+
+    fn effective_play_end_frame(&self) -> u64 {
+        if self.loop_settings.enabled && self.loop_settings.end_tick > self.loop_settings.start_tick
+        {
+            self.loop_settings.end_tick.min(self.metadata.frame_length)
+        } else {
+            self.metadata.frame_length
+        }
+    }
+
+    fn apply_loop_boundary(&mut self) -> bool {
+        if !self.loop_settings.enabled
+            || self.loop_settings.end_tick <= self.loop_settings.start_tick
+        {
+            return false;
+        }
+        match self.loop_settings.mode {
+            PlaybackLoopMode::Infinite => {
+                self.position_frame = self.loop_settings.start_tick;
+                self.request_stream_cache_fill(self.position_frame);
+                true
+            }
+            PlaybackLoopMode::Counted if self.counted_loops_remaining > 0 => {
+                self.counted_loops_remaining = self.counted_loops_remaining.saturating_sub(1);
+                self.position_frame = self.loop_settings.start_tick;
+                self.request_stream_cache_fill(self.position_frame);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn retained_scratch_bytes(&self) -> usize {
+        let stream_bytes = self
+            .stream
+            .as_ref()
+            .and_then(|stream| {
+                stream.shared.0.lock().ok().map(|shared| {
+                    shared
+                        .samples
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<f32>())
+                })
+            })
+            .unwrap_or_default();
+        let full_sample_bytes = self
+            .samples
+            .as_ref()
+            .map(|samples| {
+                samples
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<f32>())
+            })
+            .unwrap_or_default();
+        self.peq_input
+            .capacity()
+            .saturating_mul(std::mem::size_of::<f32>())
+            .saturating_add(self.peq.metrics().retained_state_bytes)
+            .saturating_add(stream_bytes)
+            .saturating_add(full_sample_bytes)
+    }
+
+    fn peq_generation(&self) -> u64 {
+        self.peq.metrics().active_config_generation
+    }
+
+    fn set_peq_prepared_config(&mut self, prepared: PreparedConfig) -> Result<u64> {
+        self.peq.set_prepared_config(prepared).map_err(|error| {
+            FlutzError::InvalidInput(format!("invalid decoded audio PEQ config: {error}"))
+        })?;
+        Ok(self
+            .peq
+            .metrics()
+            .pending_config_generation
+            .unwrap_or_else(|| self.peq.metrics().active_config_generation))
+    }
+
+    fn stream_cache_debug(&self) -> Option<DecodedStreamCacheDebug> {
+        let Some(stream) = &self.stream else {
+            return Some(DecodedStreamCacheDebug {
+                streaming: false,
+                cache_start_frame: 0,
+                cache_frames: 0,
+                cache_capacity_frames: 0,
+                source_channels: self.metadata.channels,
+                cached_sample_capacity: 0,
+                full_sample_len: self.samples.as_ref().map(Vec::len).unwrap_or_default(),
+                full_sample_capacity: self.samples.as_ref().map(Vec::capacity).unwrap_or_default(),
+                request_generation: 0,
+                filled_generation: 0,
+                last_error: None,
+            });
+        };
+        let shared = stream.shared.0.lock().ok()?;
+        Some(DecodedStreamCacheDebug {
+            streaming: true,
+            cache_start_frame: shared.cache_start_frame,
+            cache_frames: shared.cache_frames,
+            cache_capacity_frames: shared.cache_capacity_frames,
+            source_channels: shared.source_channels,
+            cached_sample_capacity: shared.samples.capacity(),
+            full_sample_len: 0,
+            full_sample_capacity: 0,
+            request_generation: shared.request_generation,
+            filled_generation: shared.filled_generation,
+            last_error: shared.last_error.clone(),
+        })
+    }
+
+    fn wait_for_stream_cache(&self, timeout: Duration) -> bool {
+        let Some(stream) = &self.stream else {
+            return true;
+        };
+        let target_frame = self.position_frame;
+        let (lock, condvar) = &*stream.shared;
+        let Ok(shared) = lock.lock() else {
+            return false;
+        };
+        if frame_in_cache(&shared, target_frame) {
+            return true;
+        }
+        match condvar.wait_timeout_while(shared, timeout, |shared| {
+            !shared.shutdown && shared.last_error.is_none() && !frame_in_cache(shared, target_frame)
+        }) {
+            Ok((shared, _)) => frame_in_cache(&shared, target_frame),
+            Err(_) => false,
+        }
+    }
+
+    fn request_stream_cache_fill(&self, frame: u64) {
+        let Some(stream) = &self.stream else {
+            return;
+        };
+        let (lock, condvar) = &*stream.shared;
+        if let Ok(mut shared) = lock.lock() {
+            if frame_in_cache(&shared, frame) && frame_in_cache(&shared, frame.saturating_add(1)) {
+                return;
+            }
+            if shared.request_start_frame == frame
+                && shared.request_generation != shared.filled_generation
+            {
+                return;
+            }
+            shared.request_start_frame = frame;
+            shared.request_generation = shared.request_generation.saturating_add(1);
+            condvar.notify_all();
+        }
+    }
+
+    fn request_stream_cache_prefetch(&self, rendered_frames: usize) {
+        let Some(stream) = &self.stream else {
+            return;
+        };
+        let threshold_frames = rendered_frames
+            .saturating_mul(4)
+            .max((self.metadata.sample_rate as usize / 2).max(1));
+        let (lock, condvar) = &*stream.shared;
+        if let Ok(mut shared) = lock.lock() {
+            let cache_end = shared
+                .cache_start_frame
+                .saturating_add(shared.cache_frames as u64);
+            let position = self.position_frame.min(self.metadata.frame_length);
+            let remaining = cache_end.saturating_sub(position);
+            if position >= shared.cache_start_frame
+                && position < cache_end
+                && remaining > threshold_frames as u64
+            {
+                return;
+            }
+            if shared.request_start_frame == position
+                && shared.request_generation != shared.filled_generation
+            {
+                return;
+            }
+            shared.request_start_frame = position;
+            shared.request_generation = shared.request_generation.saturating_add(1);
+            condvar.notify_all();
+        }
+    }
+}
+
+fn render_decoded_audio_stereo(
+    decoded: &mut DecodedAudioPlaybackState,
+    output: &mut [f32],
+    output_gain: f32,
+) -> Result<MeterReading> {
+    if decoded.peq_input.len() < output.len() {
+        decoded.peq_input.resize(output.len(), 0.0);
+    }
+    let source_channels = decoded.metadata.channels.max(1);
+    let output_frames = output.len() / 2;
+    for frame_index in 0..output_frames {
+        let output_index = frame_index * 2;
+        let Some(source_frame) = decoded.next_source_frame() else {
+            decoded.peq_input[output_index] = 0.0;
+            decoded.peq_input[output_index + 1] = 0.0;
+            continue;
+        };
+        let (left, right) = decoded_source_stereo_frame(decoded, source_frame, source_channels);
+        decoded.peq_input[output_index] = left;
+        decoded.peq_input[output_index + 1] = right;
+    }
+    decoded
+        .peq
+        .process_interleaved(&decoded.peq_input[..output.len()], output)
+        .map_err(|error| FlutzError::Runtime(format!("decoded audio PEQ failed: {error}")))?;
+    for sample in output.iter_mut() {
+        *sample *= output_gain;
+    }
+    decoded.request_stream_cache_prefetch(output_frames);
+    Ok(MeterReading::from_interleaved(output))
+}
+
+fn decoded_source_stereo_frame(
+    decoded: &DecodedAudioPlaybackState,
+    source_frame: u64,
+    source_channels: usize,
+) -> (f32, f32) {
+    if let Some(samples) = decoded.samples.as_ref() {
+        let source_index = source_frame as usize * source_channels;
+        if source_index >= samples.len() {
+            return (0.0, 0.0);
+        }
+        let left = samples[source_index];
+        let right = if source_channels == 1 {
+            left
+        } else {
+            samples.get(source_index + 1).copied().unwrap_or(left)
+        };
+        return (left, right);
+    }
+
+    let Some(stream) = decoded.stream.as_ref() else {
+        return (0.0, 0.0);
+    };
+    let (lock, condvar) = &*stream.shared;
+    let Ok(mut shared) = lock.lock() else {
+        return (0.0, 0.0);
+    };
+    if !frame_in_cache(&shared, source_frame) {
+        if shared.request_start_frame != source_frame
+            || shared.request_generation == shared.filled_generation
+        {
+            shared.request_start_frame = source_frame;
+            shared.request_generation = shared.request_generation.saturating_add(1);
+            condvar.notify_all();
+        }
+        return (0.0, 0.0);
+    }
+    let frame_offset = source_frame.saturating_sub(shared.cache_start_frame) as usize;
+    let source_index = frame_offset.saturating_mul(shared.source_channels.max(1));
+    let left = shared.samples.get(source_index).copied().unwrap_or(0.0);
+    let right = if shared.source_channels == 1 {
+        left
+    } else {
+        shared
+            .samples
+            .get(source_index + 1)
+            .copied()
+            .unwrap_or(left)
+    };
+    (left, right)
+}
+
+fn frame_in_cache(shared: &DecodedStreamCacheShared, frame: u64) -> bool {
+    let cache_end = shared
+        .cache_start_frame
+        .saturating_add(shared.cache_frames as u64);
+    frame >= shared.cache_start_frame && frame < cache_end
+}
+
+fn decoded_stream_worker(
+    mut session: DecodedAudioStreamSession,
+    shared: Arc<(Mutex<DecodedStreamCacheShared>, Condvar)>,
+) {
+    let mut decode_buffer = Vec::<f32>::new();
+    loop {
+        let (request_start, request_generation, cache_capacity_frames) = {
+            let (lock, condvar) = &*shared;
+            let mut state = match lock.lock() {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            while !state.shutdown && state.request_generation == state.filled_generation {
+                state = condvar
+                    .wait(state)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+            if state.shutdown {
+                return;
+            }
+            (
+                state.request_start_frame,
+                state.request_generation,
+                state.cache_capacity_frames,
+            )
+        };
+
+        let result = (|| -> Result<usize> {
+            session.seek_frame(request_start)?;
+            let window = session.decode_next_frames(cache_capacity_frames, &mut decode_buffer)?;
+            Ok(window.frames_decoded)
+        })();
+
+        let (lock, condvar) = &*shared;
+        let mut state = match lock.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if state.shutdown {
+            return;
+        }
+        match result {
+            Ok(frames) => {
+                state.samples.clear();
+                state.samples.extend_from_slice(&decode_buffer);
+                state.cache_start_frame = request_start;
+                state.cache_frames = frames;
+                state.last_error = None;
+            }
+            Err(error) => {
+                state.samples.clear();
+                state.cache_start_frame = request_start;
+                state.cache_frames = 0;
+                state.last_error = Some(format!("{error}"));
+            }
+        }
+        state.filled_generation = request_generation;
+        condvar.notify_all();
+    }
+}
+
+fn decoded_peq_config(peq: Option<PeqPresetFile>, sample_rate: u32, channels: u16) -> PeqConfig {
+    let mut config = peq.map(|preset| preset.config).unwrap_or_default();
+    config.sample_rate_hz = sample_rate.max(1);
+    config.channel_count = channels.max(1);
+    config.channel_layout = ChannelLayout::Interleaved;
+    config
 }
 
 #[derive(Debug, Clone)]
@@ -4130,7 +5207,8 @@ fn analyze_midi_file(bytes: &[u8]) -> Result<MidiFileScan> {
         })
         .collect::<Vec<_>>();
     let demand_profile = MidiDemandProfile::from_channel_roles(channel_roles.clone());
-    let diagnostics = PlaybackMidiScanDiagnostics::from_parts(detected_loop_type, midi_file.get_interpretation());
+    let diagnostics =
+        PlaybackMidiScanDiagnostics::from_parts(detected_loop_type, midi_file.get_interpretation());
 
     Ok(MidiFileScan {
         detected_loop_type,
@@ -4162,10 +5240,14 @@ impl PlaybackMidiScanDiagnostics {
                     byte_len: event.byte_len,
                     manufacturer_id: event.manufacturer_id.clone(),
                     recognized: event.recognized,
-                    system_mode: event.system_mode.map(|mode| midi_system_mode_label(mode).to_owned()),
-                    channel_role: event.channel_role.map(|(channel, role)| PlaybackMidiChannelRoleChange {
-                        channel,
-                        role: format!("{:?}", role).to_ascii_lowercase(),
+                    system_mode: event
+                        .system_mode
+                        .map(|mode| midi_system_mode_label(mode).to_owned()),
+                    channel_role: event.channel_role.map(|(channel, role)| {
+                        PlaybackMidiChannelRoleChange {
+                            channel,
+                            role: format!("{:?}", role).to_ascii_lowercase(),
+                        }
                     }),
                     warning: event.warning.clone(),
                     bytes_hex: event.bytes_hex.clone(),
@@ -4229,9 +5311,7 @@ fn render_mixed_audio_guarded(
                     detail: error.to_string(),
                     backtrace: None,
                     frames_requested: context.frames_requested,
-                    midi_source: context
-                        .midi_source
-                        .map(|path| path.display().to_string()),
+                    midi_source: context.midi_source.map(|path| path.display().to_string()),
                     soundfont_ids: soundfont_ids.to_vec(),
                     midi_scan: context.midi_scan.clone(),
                 },
@@ -4251,9 +5331,7 @@ fn render_mixed_audio_guarded(
                     detail: panic_payload_to_string(payload),
                     backtrace: Some(Backtrace::force_capture().to_string()),
                     frames_requested: context.frames_requested,
-                    midi_source: context
-                        .midi_source
-                        .map(|path| path.display().to_string()),
+                    midi_source: context.midi_source.map(|path| path.display().to_string()),
                     soundfont_ids: soundfont_ids.to_vec(),
                     midi_scan: context.midi_scan.clone(),
                 },

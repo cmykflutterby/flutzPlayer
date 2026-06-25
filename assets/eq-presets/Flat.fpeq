@@ -1,0 +1,18 @@
+[metadata]
+name = "Flat"
+
+[config]
+output_gain_db = 0.0
+wet_mix = 1.0
+
+[[config.bands]]
+enabled = false
+filter_type = "bell"
+frequency_hz = 1000.0
+gain_db = 0.0
+attack_ms = 10.0
+release_ms = 80.0
+
+[config.bands.bandwidth]
+mode = "q"
+value = 0.800000011920929

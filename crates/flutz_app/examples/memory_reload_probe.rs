@@ -507,7 +507,13 @@ fn elapsed_ms(start: Instant) -> u64 {
 }
 
 fn new_controller(args: &ProbeArgs, catalog: Vec<SoundFontCatalogEntry>) -> PlaybackController {
-    PlaybackController::new(args.data_dir.clone(), catalog, AudioBackend::Sdl3, false, false)
+    PlaybackController::new(
+        args.data_dir.clone(),
+        catalog,
+        AudioBackend::Sdl3,
+        false,
+        false,
+    )
 }
 
 fn soundfont_catalog(

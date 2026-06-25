@@ -615,30 +615,16 @@ fn summarize_event(message: &Message, tick: i32, time_seconds: f64) -> Option<Mi
             let event = status & 0xF0;
             let channel = status & 0x0F;
             let (kind, description) = match event {
-                0x80 => (
-                    "note-off",
-                    format!("note {} off velocity {}", data1, data2),
-                ),
-                0x90 if *data2 == 0 => (
-                    "note-off",
-                    format!("note {} off velocity 0", data1),
-                ),
-                0x90 => (
-                    "note-on",
-                    format!("note {} on velocity {}", data1, data2),
-                ),
+                0x80 => ("note-off", format!("note {} off velocity {}", data1, data2)),
+                0x90 if *data2 == 0 => ("note-off", format!("note {} off velocity 0", data1)),
+                0x90 => ("note-on", format!("note {} on velocity {}", data1, data2)),
                 0xA0 => (
                     "poly-pressure",
                     format!("note {} pressure {}", data1, data2),
                 ),
                 0xB0 => (
                     "control-change",
-                    format!(
-                        "cc {} ({}) value {}",
-                        data1,
-                        controller_name(*data1),
-                        data2
-                    ),
+                    format!("cc {} ({}) value {}", data1, controller_name(*data1), data2),
                 ),
                 0xC0 => ("program-change", format!("program {}", data1)),
                 0xD0 => ("channel-pressure", format!("pressure {}", data1)),

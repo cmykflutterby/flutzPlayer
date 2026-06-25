@@ -1,0 +1,102 @@
+[metadata]
+name = "Default"
+
+[config]
+output_gain_db = -2.0
+wet_mix = 1.0
+
+[[config.bands]]
+enabled = true
+filter_type = "bell"
+frequency_hz = 20.0
+gain_db = 14.699999809265137
+attack_ms = 10.0
+release_ms = 80.0
+
+[config.bands.bandwidth]
+mode = "q"
+value = 0.5
+
+[[config.bands]]
+enabled = true
+filter_type = "bell"
+frequency_hz = 50.0
+gain_db = 3.5
+attack_ms = 10.0
+release_ms = 80.0
+
+[config.bands.bandwidth]
+mode = "q"
+value = 0.5
+
+[[config.bands]]
+enabled = true
+filter_type = "bell"
+frequency_hz = 92.0
+gain_db = 10.699999809265137
+attack_ms = 10.0
+release_ms = 80.0
+
+[config.bands.bandwidth]
+mode = "q"
+value = 0.800000011920929
+
+[[config.bands]]
+enabled = true
+filter_type = "bell"
+frequency_hz = 287.0
+gain_db = 8.399999618530273
+attack_ms = 10.0
+release_ms = 80.0
+
+[config.bands.bandwidth]
+mode = "q"
+value = 0.800000011920929
+
+[[config.bands]]
+enabled = true
+filter_type = "bell"
+frequency_hz = 1000.0
+gain_db = 4.199999809265137
+attack_ms = 10.0
+release_ms = 80.0
+
+[config.bands.bandwidth]
+mode = "q"
+value = 0.800000011920929
+
+[[config.bands]]
+enabled = true
+filter_type = "bell"
+frequency_hz = 2000.0
+gain_db = 7.800000190734863
+attack_ms = 10.0
+release_ms = 80.0
+
+[config.bands.bandwidth]
+mode = "q"
+value = 0.800000011920929
+
+[[config.bands]]
+enabled = true
+filter_type = "bell"
+frequency_hz = 5000.0
+gain_db = 9.899999618530273
+attack_ms = 10.0
+release_ms = 80.0
+
+[config.bands.bandwidth]
+mode = "q"
+value = 0.800000011920929
+
+[[config.bands]]
+enabled = true
+filter_type = "bell"
+frequency_hz = 10000.0
+gain_db = 5.599999904632568
+attack_ms = 10.0
+release_ms = 80.0
+
+[config.bands.bandwidth]
+mode = "q"
+value = 0.800000011920929

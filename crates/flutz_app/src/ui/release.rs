@@ -1,4 +1,6 @@
 use eframe::egui;
+use flutz_formats::MasteringCapability;
+use flutz_peq::{Bandwidth, PeqBandConfig, PeqFilterType};
 use flutz_visualizer_egui::{paint_visualizer, VisualizerRendererConfig};
 
 use crate::app::{
@@ -24,7 +26,14 @@ const SPECTRUM_HEIGHT: f32 = 72.0;
 const TRANSPORT_HEIGHT: f32 = 80.0;
 const EDIT_PANEL_HEIGHT: f32 = 224.0;
 const EDIT_PANEL_COLLAPSED_HEIGHT: f32 = 52.0;
+const DECODED_LOOP_PANEL_HEIGHT: f32 = 92.0;
+const DECODED_EDITOR_PANEL_HEIGHT: f32 = 544.0;
+const DECODED_EDITOR_PANEL_GAP: f32 = 8.0;
+const DECODED_EDITOR_COLLAPSED_PANEL_HEIGHT: f32 =
+    DECODED_LOOP_PANEL_HEIGHT + DECODED_EDITOR_PANEL_GAP + EDIT_PANEL_COLLAPSED_HEIGHT;
+const PEQ_MIN_BAND_TABLE_HEIGHT: f32 = 124.0;
 const STATUS_HEIGHT: f32 = 22.0;
+const DECODED_STATUS_BAR_RESERVE: f32 = STATUS_HEIGHT + 8.0;
 const PANEL_GAP: f32 = 6.0;
 const MIXER_HEADER_HEIGHT: f32 = 34.0;
 const MIXER_COLLAPSED_ROW_HEIGHT: f32 = 36.0;
@@ -48,14 +57,14 @@ pub fn draw_app(context: &egui::Context, app: &mut FlutzDesktopApp) {
     sync_release_viewport(context, app);
     draw_top_action_bar(context, app);
     draw_missing_preset_warning(context, app);
-    let editor_panel_height = editor_panel_height(app);
+    let editor_panel_height = active_editor_panel_height(context, app);
 
     let top_height = HEADER_HEIGHT
         + SPECTRUM_HEIGHT
         + TRANSPORT_HEIGHT
         + PANEL_GAP * 2.0
         + if app.release_edit_mode() {
-            editor_panel_height + PANEL_GAP
+            editor_panel_height + PANEL_GAP * 2.0
         } else {
             0.0
         };
@@ -91,7 +100,9 @@ pub fn draw_app(context: &egui::Context, app: &mut FlutzDesktopApp) {
             draw_status_bar(ui, app);
         });
 
-    if app.release_edit_mode() {
+    if app.release_edit_mode()
+        && app.active_mastering_capability() != MasteringCapability::DecodedAudioPeq
+    {
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::central_panel(&context.style())
@@ -166,15 +177,41 @@ fn sync_release_viewport(context: &egui::Context, app: &mut FlutzDesktopApp) {
 }
 
 fn editor_panel_height(app: &FlutzDesktopApp) -> f32 {
-    if app.release_editor_panels_collapsed() {
+    if app.release_editor_panels_collapsed()
+        && app.active_mastering_capability() == MasteringCapability::DecodedAudioPeq
+    {
+        DECODED_EDITOR_COLLAPSED_PANEL_HEIGHT
+    } else if app.release_editor_panels_collapsed() {
         EDIT_PANEL_COLLAPSED_HEIGHT
+    } else if app.active_mastering_capability() == MasteringCapability::DecodedAudioPeq {
+        DECODED_EDITOR_PANEL_HEIGHT
     } else {
         EDIT_PANEL_HEIGHT
     }
 }
 
+fn active_editor_panel_height(context: &egui::Context, app: &FlutzDesktopApp) -> f32 {
+    if app.release_editor_panels_collapsed()
+        || app.active_mastering_capability() != MasteringCapability::DecodedAudioPeq
+    {
+        return editor_panel_height(app);
+    }
+
+    let viewport_height = context.screen_rect().height();
+    let fixed_height = TOP_ACTION_HEIGHT
+        + HEADER_HEIGHT
+        + SPECTRUM_HEIGHT
+        + TRANSPORT_HEIGHT
+        + STATUS_HEIGHT
+        + PANEL_GAP * 4.0;
+    (viewport_height - fixed_height).clamp(
+        DECODED_EDITOR_COLLAPSED_PANEL_HEIGHT,
+        DECODED_EDITOR_PANEL_HEIGHT,
+    )
+}
+
 fn editor_top_stack_height(app: &FlutzDesktopApp) -> f32 {
-    (TOP_ACTION_HEIGHT + TOP_ACTION_INNER_MARGIN * 2.0)
+    TOP_ACTION_HEIGHT
         + HEADER_HEIGHT
         + SPECTRUM_HEIGHT
         + TRANSPORT_HEIGHT
@@ -184,11 +221,19 @@ fn editor_top_stack_height(app: &FlutzDesktopApp) -> f32 {
 }
 
 fn editor_min_height(app: &FlutzDesktopApp) -> f32 {
+    if app.active_mastering_capability() == MasteringCapability::DecodedAudioPeq {
+        return (editor_top_stack_height(app) + DECODED_STATUS_BAR_RESERVE).max(PLAYER_MIN_HEIGHT);
+    }
+
     (editor_top_stack_height(app) + MIXER_HEADER_HEIGHT + MIXER_COLLAPSED_ROW_HEIGHT)
         .max(EDITOR_MIN_HEIGHT)
 }
 
 fn editor_target_height(context: &egui::Context, app: &mut FlutzDesktopApp) -> f32 {
+    if app.active_mastering_capability() == MasteringCapability::DecodedAudioPeq {
+        return editor_min_height(app);
+    }
+
     let fx_expanded = app.mixer_fx_expanded();
     let row_count = app.soundfont_rows().len().max(1) as f32;
     let mixer_rows_height = app
@@ -932,6 +977,11 @@ fn draw_spectrum_visualizer(ui: &mut egui::Ui, app: &FlutzDesktopApp) {
 }
 
 fn draw_editor_controls(ui: &mut egui::Ui, app: &mut FlutzDesktopApp) {
+    if app.active_mastering_capability() == MasteringCapability::DecodedAudioPeq {
+        draw_decoded_audio_editor_controls(ui, app);
+        return;
+    }
+
     let row_width = ui.available_width();
     let row_height = ui.available_height().max(editor_panel_height(app));
     let (row_rect, _) =
@@ -957,6 +1007,25 @@ fn draw_editor_controls(ui: &mut egui::Ui, app: &mut FlutzDesktopApp) {
     draw_master_panel(ui, app, master_rect);
 }
 
+fn draw_decoded_audio_editor_controls(ui: &mut egui::Ui, app: &mut FlutzDesktopApp) {
+    let row_width = ui.available_width();
+    let row_height = ui.available_height();
+    let (row_rect, _) =
+        ui.allocate_exact_size(egui::vec2(row_width, row_height), egui::Sense::hover());
+    let gap = DECODED_EDITOR_PANEL_GAP;
+    let loop_rect = egui::Rect::from_min_size(
+        row_rect.min,
+        egui::vec2(row_width, DECODED_LOOP_PANEL_HEIGHT),
+    );
+    let peq_rect = egui::Rect::from_min_max(
+        egui::pos2(row_rect.left(), loop_rect.bottom() + gap),
+        row_rect.right_bottom(),
+    );
+
+    draw_decoded_loop_panel(ui, app, loop_rect);
+    draw_decoded_peq_editor(ui, app, peq_rect);
+}
+
 fn format_time(seconds: f64) -> String {
     let total = seconds.max(0.0).round() as u64;
     let minutes = total / 60;
@@ -971,6 +1040,7 @@ fn draw_transport(ui: &mut egui::Ui, app: &mut FlutzDesktopApp) {
     let total_ticks = app.transport_tick_length();
     let current_seconds = app.transport_seconds();
     let current_tick = app.transport_tick();
+    let unit_prefix = app.transport_unit_prefix();
     let audio_unavailable = app
         .audio_status()
         .to_ascii_lowercase()
@@ -1043,7 +1113,7 @@ fn draw_transport(ui: &mut egui::Ui, app: &mut FlutzDesktopApp) {
                     ui.add_sized(
                         [44.0, 18.0],
                         egui::Label::new(
-                            egui::RichText::new(format!("t:{current_tick}")).monospace(),
+                            egui::RichText::new(format!("{unit_prefix}{current_tick}")).monospace(),
                         ),
                     );
                     let line_width = (bounded_available_width(ui) - 76.0).max(16.0);
@@ -1057,7 +1127,8 @@ fn draw_transport(ui: &mut egui::Ui, app: &mut FlutzDesktopApp) {
                         ui.add_sized(
                             [72.0, 18.0],
                             egui::Label::new(
-                                egui::RichText::new(format!("t:{total_ticks}")).monospace(),
+                                egui::RichText::new(format!("{unit_prefix}{total_ticks}"))
+                                    .monospace(),
                             ),
                         );
                     });
@@ -1274,7 +1345,11 @@ fn draw_soundfont_manager(ui: &mut egui::Ui, app: &mut FlutzDesktopApp, panel_re
 
     panel_ui.add_space(12.0);
 
-    panel_ui.horizontal(|ui| {
+    draw_release_loop_controls(&mut panel_ui, app);
+}
+
+fn draw_release_loop_controls(ui: &mut egui::Ui, app: &mut FlutzDesktopApp) {
+    ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 8.0;
         ui.add_sized([64.0, 20.0], egui::Label::new("Loop"));
         let mut loop_mode = app.loop_mode_value();
@@ -1310,18 +1385,20 @@ fn draw_soundfont_manager(ui: &mut egui::Ui, app: &mut FlutzDesktopApp, panel_re
         {
             app.set_loop_mode(loop_mode);
         }
+        ui.label(app.transport_unit_label());
     });
 
-    panel_ui.horizontal(|ui| {
+    ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 8.0;
         ui.add_space(72.0);
         ui.label("Start");
+        let unit_prefix = app.transport_unit_prefix();
         let mut loop_start_tick = app.loop_start_tick_value();
         if ui
             .add(
                 egui::DragValue::new(&mut loop_start_tick)
                     .speed(1.0)
-                    .prefix("t:"),
+                    .prefix(unit_prefix),
             )
             .changed()
         {
@@ -1333,7 +1410,7 @@ fn draw_soundfont_manager(ui: &mut egui::Ui, app: &mut FlutzDesktopApp, panel_re
             .add(
                 egui::DragValue::new(&mut loop_end_tick)
                     .speed(1.0)
-                    .prefix("t:"),
+                    .prefix(unit_prefix),
             )
             .changed()
         {
@@ -1510,6 +1587,354 @@ fn draw_master_limiter_row(ui: &mut egui::Ui, master: &mut crate::app::MasterCon
             egui::DragValue::new(&mut master.limiter_amount).speed(0.01),
         );
     });
+}
+
+fn draw_decoded_loop_panel(ui: &mut egui::Ui, app: &mut FlutzDesktopApp, panel_rect: egui::Rect) {
+    let content_rect = draw_panel_shell(ui, panel_rect.shrink2(egui::vec2(0.0, 2.0)));
+    let mut panel_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(content_rect)
+            .layout(egui::Layout::top_down(egui::Align::Min)),
+    );
+    panel_ui.set_width(content_rect.width());
+
+    panel_ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Loop").size(16.0));
+        ui.separator();
+        ui.label(app.transport_unit_label());
+    });
+    panel_ui.add_space(4.0);
+    draw_release_loop_controls(&mut panel_ui, app);
+}
+
+fn draw_decoded_peq_editor(ui: &mut egui::Ui, app: &mut FlutzDesktopApp, panel_rect: egui::Rect) {
+    let content_rect = draw_panel_shell(ui, panel_rect.shrink2(egui::vec2(0.0, 2.0)));
+    let mut panel_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(content_rect)
+            .layout(egui::Layout::top_down(egui::Align::Min)),
+    );
+    panel_ui.set_width(content_rect.width());
+    panel_ui.set_min_height(content_rect.height());
+
+    let collapsed = app.release_editor_panels_collapsed();
+    panel_ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Parametric EQ").size(16.0));
+        if ui
+            .add_sized(
+                [22.0, 20.0],
+                egui::Button::new(if collapsed { "▶" } else { "▼" }),
+            )
+            .clicked()
+        {
+            app.toggle_release_editor_panels_collapsed();
+        }
+        ui.separator();
+        ui.label(app.decoded_peq_config_source().label());
+        ui.add(egui::Label::new(app.decoded_peq_preset_display_name()).truncate());
+    });
+    if collapsed {
+        return;
+    }
+
+    let mut config = app.decoded_peq_config().clone();
+    config.bands.sort_by(|left, right| {
+        left.frequency_hz
+            .partial_cmp(&right.frequency_hz)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let original = config.clone();
+
+    panel_ui.add_space(6.0);
+    draw_peq_section_label(&mut panel_ui, "Response");
+    draw_peq_response_preview(&mut panel_ui, &config);
+
+    panel_ui.add_space(6.0);
+    panel_ui.horizontal(|ui| {
+        ui.add_sized([96.0, 20.0], egui::Label::new("Preset/config:"));
+        egui::ComboBox::from_id_salt("decoded_peq_preset_config")
+            .width(260.0)
+            .selected_text(app.decoded_peq_preset_display_name())
+            .show_ui(ui, |ui| {
+                for preset_name in app.builtin_decoded_peq_preset_names() {
+                    if ui.selectable_label(false, *preset_name).clicked() {
+                        app.apply_builtin_decoded_peq_preset(preset_name);
+                    }
+                }
+            });
+        ui.add(egui::Label::new(app.decoded_peq_preset_path_label()).truncate());
+    });
+    panel_ui.horizontal(|ui| {
+        if ui.button("Load PEQ...").clicked() {
+            app.load_decoded_peq_preset_dialog();
+        }
+        if ui.button("Save PEQ").clicked() {
+            app.save_decoded_peq_preset();
+        }
+        if ui.button("Save PEQ As...").clicked() {
+            app.save_decoded_peq_preset_as();
+        }
+        if ui.button("sD").on_hover_text("Save current PEQ as the default in preferences.ini").clicked() {
+            app.save_decoded_peq_default();
+        }
+        if ui.button("Reset").clicked() {
+            app.reset_decoded_peq_config();
+        }
+        let mut bypass = app.decoded_peq_bypass_enabled();
+        if ui.checkbox(&mut bypass, "Bypass EQ").changed() {
+            app.set_decoded_peq_bypass_enabled(bypass);
+        }
+    });
+
+    panel_ui.add_space(6.0);
+    draw_peq_section_label(&mut panel_ui, "Global");
+    panel_ui.horizontal(|ui| {
+        ui.add_sized([96.0, 20.0], egui::Label::new("Output gain"));
+        ui.add(egui::Slider::new(&mut config.output_gain_db, -24.0..=24.0).show_value(false));
+        ui.add_sized(
+            [64.0, 20.0],
+            egui::Label::new(format!("{:+.1} dB", config.output_gain_db)),
+        );
+        ui.add_sized([46.0, 20.0], egui::Label::new("Mix"));
+        ui.add(egui::Slider::new(&mut config.wet_mix, 0.0..=1.0).show_value(false));
+        ui.label(format!("{:.0}%", config.wet_mix * 100.0));
+    });
+    panel_ui.horizontal(|ui| {
+        ui.label(format!(
+            "Sample rate {} Hz   Channels {}   Layout {:?}   Processing {}",
+            config.sample_rate_hz,
+            config.channel_count,
+            config.channel_layout,
+            if app.decoded_peq_bypass_enabled() {
+                "Bypassed"
+            } else {
+                "Active"
+            }
+        ));
+    });
+
+    panel_ui.add_space(8.0);
+    panel_ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Bands").strong());
+        if ui.add_sized([28.0, 22.0], egui::Button::new("+")).clicked() {
+            config.bands.push(PeqBandConfig {
+                frequency_hz: 1_000.0,
+                gain_db: 0.0,
+                attack_ms: 5.0,
+                release_ms: 60.0,
+                ..PeqBandConfig::default()
+            });
+        }
+        ui.label(format!("{} band(s)", config.bands.len()));
+    });
+
+    let available_height = (content_rect.bottom() - panel_ui.cursor().top()).max(72.0);
+    let band_height = available_height.max(PEQ_MIN_BAND_TABLE_HEIGHT);
+    egui::ScrollArea::vertical()
+        .max_height(band_height)
+        .auto_shrink([false, false])
+        .show(&mut panel_ui, |ui| {
+            draw_peq_band_header(ui);
+            let mut remove_index = None;
+            let mut duplicate_index = None;
+            for (index, band) in config.bands.iter_mut().enumerate() {
+                draw_peq_band_row(ui, index, band, &mut duplicate_index, &mut remove_index);
+            }
+            if let Some(index) = duplicate_index {
+                if let Some(band) = config.bands.get(index).cloned() {
+                    config.bands.push(band);
+                }
+            }
+            if let Some(index) = remove_index {
+                if index < config.bands.len() {
+                    config.bands.remove(index);
+                }
+            }
+        });
+
+    if config != original {
+        app.apply_decoded_peq_config(config);
+    }
+}
+
+fn draw_peq_section_label(ui: &mut egui::Ui, label: &str) {
+    ui.label(egui::RichText::new(label).strong());
+}
+
+fn draw_peq_band_header(ui: &mut egui::Ui) {
+    ui.horizontal(|ui| {
+        ui.add_sized([26.0, 18.0], egui::Label::new("On"));
+        ui.add_sized([78.0, 18.0], egui::Label::new("Type"));
+        ui.add_sized([104.0, 18.0], egui::Label::new("Frequency"));
+        ui.add_sized([84.0, 18.0], egui::Label::new("Gain"));
+        ui.add_sized([72.0, 18.0], egui::Label::new("Q/Width"));
+        ui.add_sized([76.0, 18.0], egui::Label::new("Attack"));
+        ui.add_sized([76.0, 18.0], egui::Label::new("Rel"));
+        ui.add_sized([54.0, 18.0], egui::Label::new("Dup/Del"));
+    });
+}
+
+fn draw_peq_band_row(
+    ui: &mut egui::Ui,
+    index: usize,
+    band: &mut PeqBandConfig,
+    duplicate_index: &mut Option<usize>,
+    remove_index: &mut Option<usize>,
+) {
+    ui.horizontal(|ui| {
+        ui.add_sized([26.0, 22.0], egui::Checkbox::new(&mut band.enabled, ""));
+        egui::ComboBox::from_id_salt(("peq_filter", index))
+            .width(78.0)
+            .selected_text(match band.filter_type {
+                PeqFilterType::Bell => "Bell",
+                PeqFilterType::LowShelf => "LowShelf",
+                PeqFilterType::HighShelf => "HighShelf",
+            })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut band.filter_type, PeqFilterType::Bell, "Bell");
+                ui.selectable_value(&mut band.filter_type, PeqFilterType::LowShelf, "LowShelf");
+                ui.selectable_value(&mut band.filter_type, PeqFilterType::HighShelf, "HighShelf");
+            });
+        ui.add_sized(
+            [104.0, 22.0],
+            egui::DragValue::new(&mut band.frequency_hz)
+                .range(20.0..=24_000.0)
+                .speed(1.0)
+                .suffix(" Hz"),
+        );
+        ui.add_sized(
+            [84.0, 22.0],
+            egui::DragValue::new(&mut band.gain_db)
+                .range(-24.0..=24.0)
+                .speed(0.1)
+                .suffix(" dB"),
+        );
+        let mut q = match band.bandwidth {
+            Bandwidth::Q { value } | Bandwidth::Octaves { value } => value,
+        };
+        if ui
+            .add_sized(
+                [72.0, 22.0],
+                egui::DragValue::new(&mut q).range(0.05..=12.0).speed(0.05),
+            )
+            .changed()
+        {
+            band.bandwidth = Bandwidth::Q { value: q };
+        }
+        ui.add_sized(
+            [76.0, 22.0],
+            egui::DragValue::new(&mut band.attack_ms)
+                .range(0.0..=5_000.0)
+                .speed(1.0)
+                .suffix(" ms"),
+        );
+        ui.add_sized(
+            [76.0, 22.0],
+            egui::DragValue::new(&mut band.release_ms)
+                .range(0.0..=5_000.0)
+                .speed(1.0)
+                .suffix(" ms"),
+        );
+        if ui.button("+").clicked() {
+            *duplicate_index = Some(index);
+        }
+        if ui.button("-").clicked() {
+            *remove_index = Some(index);
+        }
+    });
+}
+
+fn draw_peq_response_preview(ui: &mut egui::Ui, config: &flutz_peq::PeqConfig) {
+    let width = ui.available_width().max(120.0);
+    let height = 104.0;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+    let painter = ui.painter();
+    let label_color = egui::Color32::from_rgb(188, 190, 198);
+    let font = egui::FontId::monospace(11.0);
+    let graph_rect = egui::Rect::from_min_max(
+        egui::pos2(rect.left() + 44.0, rect.top() + 4.0),
+        egui::pos2(rect.right() - 4.0, rect.bottom() - 20.0),
+    );
+    painter.rect_stroke(
+        graph_rect,
+        2.0,
+        egui::Stroke::new(1.0, RELEASE_PANEL_STROKE),
+        egui::StrokeKind::Inside,
+    );
+    painter.line_segment(
+        [graph_rect.left_center(), graph_rect.right_center()],
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(108, 112, 122)),
+    );
+    for (label, t) in [
+        ("+12 dB", 0.0_f32),
+        ("+6 dB", 0.25),
+        ("0 dB", 0.5),
+        ("-6 dB", 0.75),
+        ("-12 dB", 1.0),
+    ] {
+        let y = egui::lerp(graph_rect.top()..=graph_rect.bottom(), t);
+        painter.text(
+            egui::pos2(rect.left() + 2.0, y),
+            egui::Align2::LEFT_CENTER,
+            label,
+            font.clone(),
+            label_color,
+        );
+    }
+    for (label, t) in [
+        ("20", 0.0_f32),
+        ("50", 0.1326),
+        ("100", 0.2330),
+        ("500", 0.4663),
+        ("1k", 0.5663),
+        ("5k", 0.7997),
+        ("10k", 0.9003),
+        ("20k Hz", 1.0),
+    ] {
+        let x = egui::lerp(graph_rect.left()..=graph_rect.right(), t);
+        painter.text(
+            egui::pos2(x, rect.bottom() - 2.0),
+            egui::Align2::CENTER_BOTTOM,
+            label,
+            font.clone(),
+            label_color,
+        );
+    }
+    let mut points = Vec::with_capacity(96);
+    for index in 0..96 {
+        let t = index as f32 / 95.0;
+        let hz = 20.0_f32 * (1_000.0_f32).powf(t);
+        let mut gain = config.output_gain_db;
+        for band in &config.bands {
+            if !band.enabled {
+                continue;
+            }
+            let q = match band.bandwidth {
+                Bandwidth::Q { value } | Bandwidth::Octaves { value } => value.max(0.05),
+            };
+            let distance = (hz / band.frequency_hz.max(20.0)).log2().abs();
+            let influence = match band.filter_type {
+                PeqFilterType::Bell => (1.0 - distance * q).clamp(0.0, 1.0),
+                PeqFilterType::LowShelf => {
+                    (1.0 - (hz / band.frequency_hz.max(20.0)).log2()).clamp(0.0, 1.0)
+                }
+                PeqFilterType::HighShelf => {
+                    (1.0 + (hz / band.frequency_hz.max(20.0)).log2()).clamp(0.0, 1.0)
+                }
+            };
+            gain += band.gain_db * influence * config.wet_mix;
+        }
+        let x = egui::lerp(graph_rect.left()..=graph_rect.right(), t);
+        let y = egui::lerp(
+            graph_rect.bottom()..=graph_rect.top(),
+            ((gain + 12.0) / 24.0).clamp(0.0, 1.0),
+        );
+        points.push(egui::pos2(x, y));
+    }
+    painter.add(egui::Shape::line(
+        points,
+        egui::Stroke::new(2.0, egui::Color32::from_rgb(139, 233, 253)),
+    ));
 }
 
 fn draw_mixer(ui: &mut egui::Ui, app: &mut FlutzDesktopApp) {

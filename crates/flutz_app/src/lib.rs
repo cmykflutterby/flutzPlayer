@@ -23,6 +23,7 @@ use flutz_dat::{
     read::{parse_dat_index, parse_dat_index_file, read_soundfont_coverage_json_from_file},
     soundfont_json::SoundFontCoverageJson,
 };
+use flutz_formats::builtin_registry;
 use flutz_synth::{
     BankProgram, MelodicCoverage, PercussionCoverage, PercussionKeyRange, SoundFontCoverage,
     SoundFontCoverageMetadata,
@@ -415,10 +416,48 @@ fn run_tool(command: ToolCommand) -> Result<()> {
 }
 
 fn tool_help(default_data_dir: &Path) -> String {
+    let open_inputs = gui_launch_input_summary();
+    let playback_inputs = playback_check_input_summary();
+    let verify_inputs = verify_input_summary();
     format!(
-        "flutzplayer\n\nGUI launch:\n  flutzplayer --gui [project.fmid|song.mid|playlist.fplist] [--data-dir <dat-directory>] [--audio-backend sdl3|wasapi] [--debug-memory] [--debug-latency] [--debug-analyzer] [--debug-render-errors]\n  flutzplayer [project.fmid|song.mid|playlist.fplist]\n\nHeadless/console launch:\n  flutzplayer --headless [--data-dir <dat-directory>]\n\nConsole diagnostics:\n  flutzplayer --verify <file.fmid|file.dat|file.mid>\n  flutzplayer --inspect-dat [file.dat|dat-directory]\n  flutzplayer --check-playback <file.fmid|file.mid> [--data-dir <dat-directory>] [--debug-render-errors]\n  flutzplayer --debug-env\n  flutzplayer --help\n\nData files default to a data folder beside the executable:\n  {}\n\nUse --data-dir to point the player at a different DAT data folder. Use --audio-backend or FLUTZ_AUDIO_BACKEND to choose sdl3 or wasapi. Use --debug-memory to enable jemalloc/domain memory snapshots and session log output in debug builds. Use --debug-latency to write sparse latency JSONL in debug builds. Use --debug-analyzer to write spectrum analyzer JSONL under _local/analyzer-trace. Use --debug-render-errors to capture panic-safe render failure traces and MIDI SysEx interpretation detail under _local/render-error-trace in debug-friendly runs. Launch defaults: Explorer/no-terminal starts GUI; terminal/no-args prints this diagnostic surface; a bare project path opens the GUI directly; --headless always prints this diagnostic surface.",
+        "flutzplayer\n\nGUI launch:\n  flutzplayer --gui [{open_inputs}] [--data-dir <dat-directory>] [--audio-backend sdl3|wasapi] [--debug-memory] [--debug-latency] [--debug-analyzer] [--debug-render-errors]\n  flutzplayer [{open_inputs}]\n\nHeadless/console launch:\n  flutzplayer --headless [--data-dir <dat-directory>]\n\nConsole diagnostics:\n  flutzplayer --verify <{verify_inputs}>\n  flutzplayer --inspect-dat [file.dat|dat-directory]\n  flutzplayer --check-playback <{playback_inputs}> [--data-dir <dat-directory>] [--debug-render-errors]\n  flutzplayer --debug-env\n  flutzplayer --help\n\nData files default to a data folder beside the executable:\n  {}\n\nUse --data-dir to point the player at a different DAT data folder. Use --audio-backend or FLUTZ_AUDIO_BACKEND to choose sdl3 or wasapi. Use --debug-memory to enable jemalloc/domain memory snapshots and session log output in debug builds. Use --debug-latency to write sparse latency JSONL in debug builds. Use --debug-analyzer to write spectrum analyzer JSONL under _local/analyzer-trace. Use --debug-render-errors to capture panic-safe render failure traces and MIDI SysEx interpretation detail under _local/render-error-trace in debug-friendly runs. Launch defaults: Explorer/no-terminal starts GUI; terminal/no-args prints this diagnostic surface; a bare project path opens the GUI directly; --headless always prints this diagnostic surface.",
         default_data_dir.display()
     )
+}
+
+fn gui_launch_input_summary() -> String {
+    let mut extensions = builtin_registry()
+        .descriptors()
+        .iter()
+        .flat_map(|descriptor| {
+            descriptor
+                .extensions
+                .iter()
+                .chain(descriptor.wrapped_extensions.iter())
+                .map(|extension| format!("file.{extension}"))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    extensions.push("playlist.fplist".to_owned());
+    extensions.sort();
+    extensions.dedup();
+    extensions.join("|")
+}
+
+fn playback_check_input_summary() -> &'static str {
+    "file.fmid|file.mid|file.midi"
+}
+
+fn verify_input_summary() -> &'static str {
+    "file.fmid|file.mid|file.midi|file.dat"
+}
+
+#[cfg(windows)]
+pub fn windows_file_association_specs() -> Vec<(String, String, String)> {
+    windows_file_association::file_association_specs()
+        .into_iter()
+        .map(|spec| (spec.extension, spec.prog_id, spec.friendly_type_name))
+        .collect()
 }
 
 fn check_playback(data_dir: &Path, midi_path: &Path, debug_render_errors: bool) -> Result<()> {

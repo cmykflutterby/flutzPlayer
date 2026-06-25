@@ -253,7 +253,7 @@ fn run_policy(
     command
         .arg("run")
         .arg("-p")
-        .arg("flutz_app")
+        .arg("flutzplayer")
         .arg("--example")
         .arg("memory_reload_probe")
         .arg("--features")

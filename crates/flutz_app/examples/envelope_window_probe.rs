@@ -104,8 +104,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if stalled_iterations >= 256 {
                 println!(
                     "{{\"event\":\"envelope_window_probe_stalled\",\"tick\":{},\"iterations\":{}}}",
-                    tick_after,
-                    stalled_iterations,
+                    tick_after, stalled_iterations,
                 );
                 break;
             }
@@ -254,7 +253,8 @@ struct EnvelopeSummary {
 }
 
 fn next_arg(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, String> {
-    args.next().ok_or_else(|| format!("{flag} requires a value"))
+    args.next()
+        .ok_or_else(|| format!("{flag} requires a value"))
 }
 
 fn soundfont_catalog(
@@ -314,8 +314,10 @@ fn requested_soundfonts(fmid: &FmidFile) -> Vec<String> {
 
 fn playback_loop_settings(fmid: &FmidFile) -> PlaybackLoopSettings {
     let mut settings = PlaybackLoopSettings::default();
-    settings.enabled = matches!(fmid.looping.mode, FmidLoopMode::Infinite | FmidLoopMode::Counted)
-        && fmid.looping.enabled
+    settings.enabled = matches!(
+        fmid.looping.mode,
+        FmidLoopMode::Infinite | FmidLoopMode::Counted
+    ) && fmid.looping.enabled
         && fmid.looping.end_tick > fmid.looping.start_tick;
     settings.start_tick = fmid.looping.start_tick;
     settings.end_tick = fmid.looping.end_tick;
@@ -385,10 +387,21 @@ fn print_record(record: &EnvelopeRecord) {
     );
 }
 
-fn summarize(records: &[EnvelopeRecord], analysis_start: u64, analysis_end: u64) -> EnvelopeSummary {
+fn summarize(
+    records: &[EnvelopeRecord],
+    analysis_start: u64,
+    analysis_end: u64,
+) -> EnvelopeSummary {
     let window_records = records
         .iter()
-        .filter(|record| overlaps(record.tick_before, record.tick_after, analysis_start, analysis_end))
+        .filter(|record| {
+            overlaps(
+                record.tick_before,
+                record.tick_after,
+                analysis_start,
+                analysis_end,
+            )
+        })
         .collect::<Vec<_>>();
     let min_env_record = window_records
         .iter()
@@ -427,15 +440,21 @@ fn summarize(records: &[EnvelopeRecord], analysis_start: u64, analysis_end: u64)
         .map(|record| record.active_voices)
         .max()
         .unwrap_or_default();
-    let min_env_value_avg = min_env_record.map(|record| record.env_value_avg).unwrap_or_default();
-    let max_env_value_avg = max_env_record.map(|record| record.env_value_avg).unwrap_or_default();
+    let min_env_value_avg = min_env_record
+        .map(|record| record.env_value_avg)
+        .unwrap_or_default();
+    let max_env_value_avg = max_env_record
+        .map(|record| record.env_value_avg)
+        .unwrap_or_default();
     let max_release_voices = max_release_record
         .map(|record| record.env_release_voices)
         .unwrap_or_default();
     let max_decay_voices = max_decay_record
         .map(|record| record.env_decay_voices)
         .unwrap_or_default();
-    let min_render_peak = min_render_record.map(|record| record.render_peak).unwrap_or_default();
+    let min_render_peak = min_render_record
+        .map(|record| record.render_peak)
+        .unwrap_or_default();
     let finding = if max_env_value_avg > 0.0 && min_env_value_avg < max_env_value_avg * 0.65 {
         format!(
             "envelope energy dropped inside the window: avg envelope value fell from {:.3} to {:.3}",
@@ -457,9 +476,13 @@ fn summarize(records: &[EnvelopeRecord], analysis_start: u64, analysis_end: u64)
         range_record_count: window_records.len(),
         peak_active_voices,
         min_env_value_avg,
-        min_env_tick_before: min_env_record.map(|record| record.tick_before).unwrap_or_default(),
+        min_env_tick_before: min_env_record
+            .map(|record| record.tick_before)
+            .unwrap_or_default(),
         max_env_value_avg,
-        max_env_tick_before: max_env_record.map(|record| record.tick_before).unwrap_or_default(),
+        max_env_tick_before: max_env_record
+            .map(|record| record.tick_before)
+            .unwrap_or_default(),
         max_release_voices,
         max_release_tick_before: max_release_record
             .map(|record| record.tick_before)

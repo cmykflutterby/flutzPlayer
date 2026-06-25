@@ -109,8 +109,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if stalled_iterations >= 256 {
                 println!(
                     "{{\"event\":\"voice_window_probe_stalled\",\"tick\":{},\"iterations\":{}}}",
-                    tick_after,
-                    stalled_iterations,
+                    tick_after, stalled_iterations,
                 );
                 break;
             }
@@ -281,7 +280,8 @@ struct VoiceSummary {
 }
 
 fn next_arg(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, String> {
-    args.next().ok_or_else(|| format!("{flag} requires a value"))
+    args.next()
+        .ok_or_else(|| format!("{flag} requires a value"))
 }
 
 fn soundfont_catalog(
@@ -341,8 +341,10 @@ fn requested_soundfonts(fmid: &FmidFile) -> Vec<String> {
 
 fn playback_loop_settings(fmid: &FmidFile) -> PlaybackLoopSettings {
     let mut settings = PlaybackLoopSettings::default();
-    settings.enabled = matches!(fmid.looping.mode, FmidLoopMode::Infinite | FmidLoopMode::Counted)
-        && fmid.looping.enabled
+    settings.enabled = matches!(
+        fmid.looping.mode,
+        FmidLoopMode::Infinite | FmidLoopMode::Counted
+    ) && fmid.looping.enabled
         && fmid.looping.end_tick > fmid.looping.start_tick;
     settings.start_tick = fmid.looping.start_tick;
     settings.end_tick = fmid.looping.end_tick;
@@ -411,7 +413,14 @@ fn print_record(record: &VoiceRecord) {
 fn summarize(records: &[VoiceRecord], analysis_start: u64, analysis_end: u64) -> VoiceSummary {
     let window_records = records
         .iter()
-        .filter(|record| overlaps(record.tick_before, record.tick_after, analysis_start, analysis_end))
+        .filter(|record| {
+            overlaps(
+                record.tick_before,
+                record.tick_after,
+                analysis_start,
+                analysis_end,
+            )
+        })
         .collect::<Vec<_>>();
     let peak_record = window_records
         .iter()
@@ -425,13 +434,17 @@ fn summarize(records: &[VoiceRecord], analysis_start: u64, analysis_end: u64) ->
         .iter()
         .max_by_key(|record| record.deltas.contention_steals)
         .copied();
-    let total_voices = peak_record.map(|record| record.total_voices).unwrap_or_default();
+    let total_voices = peak_record
+        .map(|record| record.total_voices)
+        .unwrap_or_default();
     let peak_active_voices = window_records
         .iter()
         .map(|record| record.active_voices)
         .max()
         .unwrap_or_default();
-    let peak_utilization = peak_record.map(|record| record.utilization).unwrap_or_default();
+    let peak_utilization = peak_record
+        .map(|record| record.utilization)
+        .unwrap_or_default();
     let window_voice_requests = window_records
         .iter()
         .map(|record| record.deltas.voice_requests)
@@ -457,7 +470,9 @@ fn summarize(records: &[VoiceRecord], analysis_start: u64, analysis_end: u64) ->
             "voice contention observed: {} steals across {} sample(s) in the requested tick window",
             window_contention_steals, contention_sample_count
         )
-    } else if total_voices > 0 && peak_active_voices.saturating_mul(10) >= total_voices.saturating_mul(9) {
+    } else if total_voices > 0
+        && peak_active_voices.saturating_mul(10) >= total_voices.saturating_mul(9)
+    {
         format!(
             "no steals observed, but utilization peaked high at {:.1}% of available voices",
             peak_utilization * 100.0
@@ -476,7 +491,9 @@ fn summarize(records: &[VoiceRecord], analysis_start: u64, analysis_end: u64) ->
         total_voices,
         peak_active_voices,
         peak_utilization,
-        peak_utilization_tick_before: peak_record.map(|record| record.tick_before).unwrap_or_default(),
+        peak_utilization_tick_before: peak_record
+            .map(|record| record.tick_before)
+            .unwrap_or_default(),
         window_voice_requests,
         window_exclusive_reuses,
         window_free_allocations,

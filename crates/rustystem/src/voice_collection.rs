@@ -80,8 +80,7 @@ impl VoiceCollection {
         if (self.active_voice_count) < self.voices.len() {
             let i = self.active_voice_count;
             self.active_voice_count += 1;
-            self.max_active_voice_count =
-                self.max_active_voice_count.max(self.active_voice_count);
+            self.max_active_voice_count = self.max_active_voice_count.max(self.active_voice_count);
             self.free_voice_allocations = self.free_voice_allocations.saturating_add(1);
             return Some(&mut self.voices[i]);
         }

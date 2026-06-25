@@ -175,14 +175,8 @@ impl Oscillator {
                 index2 -= loop_length as usize;
             }
 
-            let (x1, x2) = self.sample_pair_or_panic(
-                data,
-                index1,
-                index2,
-                0,
-                pitch_ratio_fp,
-                "continuous",
-            );
+            let (x1, x2) =
+                self.sample_pair_or_panic(data, index1, index2, 0, pitch_ratio_fp, "continuous");
             let a_fp = self.position_fp & (Oscillator::FRAC_UNIT - 1);
             *sample = Oscillator::FP_TO_SAMPLE
                 * ((x1 << Oscillator::FRAC_BITS) + a_fp * (x2 - x1)) as f32;
@@ -203,10 +197,24 @@ impl Oscillator {
         branch: &str,
     ) -> (i64, i64) {
         let Some(&x1) = data.get(index1) else {
-            self.panic_index_bounds(branch, index1, index2, block_offset, pitch_ratio_fp, data.len());
+            self.panic_index_bounds(
+                branch,
+                index1,
+                index2,
+                block_offset,
+                pitch_ratio_fp,
+                data.len(),
+            );
         };
         let Some(&x2) = data.get(index2) else {
-            self.panic_index_bounds(branch, index1, index2, block_offset, pitch_ratio_fp, data.len());
+            self.panic_index_bounds(
+                branch,
+                index1,
+                index2,
+                block_offset,
+                pitch_ratio_fp,
+                data.len(),
+            );
         };
         (x1 as i64, x2 as i64)
     }

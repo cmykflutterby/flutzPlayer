@@ -39,8 +39,8 @@ if (-not $SkipBuild) {
         $CargoArgs += "--release"
     }
     if (-not $NoJemallocMemory) {
-        $CargoArgs += @("--features", "flutz_app/jemalloc-memory")
-        Write-Host "Building with flutz_app/jemalloc-memory"
+        $CargoArgs += @("--features", "flutzplayer/jemalloc-memory")
+        Write-Host "Building with flutzplayer/jemalloc-memory"
     }
 
     & cargo @CargoArgs

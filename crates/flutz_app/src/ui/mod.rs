@@ -1,6 +1,6 @@
-mod theme;
 pub(crate) mod metadata_popup;
 pub(crate) mod playlist_window;
+mod theme;
 
 #[cfg(debug_assertions)]
 mod debug;

@@ -1,0 +1,15 @@
+[package]
+name = "flutz_format_pcm"
+version = "0.1.0"
+edition.workspace = true
+description = "WAV/AIFF PCM backend registration and Symphonia decode probe support for flutzPlayer."
+
+[dependencies]
+flutz_core = { path = "../flutz_core" }
+flutz_formats = { path = "../flutz_formats" }
+
+[dev-dependencies]
+serde_json = "1"
+
+[lints]
+workspace = true

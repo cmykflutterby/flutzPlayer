@@ -8,6 +8,7 @@ use std::{
     ptr, slice,
 };
 
+use flutz_formats::builtin_registry;
 use windows_sys::Win32::{
     Foundation::ERROR_FILE_NOT_FOUND,
     System::Registry::{
@@ -21,29 +22,12 @@ const CLASSES_ROOT: &str = "Software\\Classes";
 const OPEN_VERB: &str = "open";
 const OPEN_VERB_NAME: &str = "Open with flutzPlayer";
 
-struct FileAssociationSpec {
-    extension: &'static str,
-    prog_id: &'static str,
-    friendly_type_name: &'static str,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileAssociationSpec {
+    pub extension: String,
+    pub prog_id: String,
+    pub friendly_type_name: String,
 }
-
-const FILE_ASSOCIATIONS: &[FileAssociationSpec] = &[
-    FileAssociationSpec {
-        extension: ".fmid",
-        prog_id: "flutzplayer.fmid",
-        friendly_type_name: "flutzPlayer Project",
-    },
-    FileAssociationSpec {
-        extension: ".mid",
-        prog_id: "flutzplayer.mid",
-        friendly_type_name: "MIDI Sequence",
-    },
-    FileAssociationSpec {
-        extension: ".fplist",
-        prog_id: "flutzplayer.fplist",
-        friendly_type_name: "flutzPlayer Playlist",
-    },
-];
 
 pub fn ensure_file_associations() -> io::Result<()> {
     let executable = env::current_exe()?;
@@ -51,10 +35,10 @@ pub fn ensure_file_associations() -> io::Result<()> {
     let icon = format!("\"{}\",0", executable.display());
 
     let mut changed = false;
-    for association in FILE_ASSOCIATIONS {
+    for association in file_association_specs() {
         changed |= ensure_default_string_value(
-            &classes_path(association.prog_id),
-            association.friendly_type_name,
+            &classes_path(&association.prog_id),
+            &association.friendly_type_name,
         )?;
         changed |= ensure_default_string_value(
             &classes_path(&format!("{}\\DefaultIcon", association.prog_id)),
@@ -69,12 +53,15 @@ pub fn ensure_file_associations() -> io::Result<()> {
             OPEN_VERB_NAME,
         )?;
         changed |= ensure_default_string_value(
-            &classes_path(&format!("{}\\shell\\{OPEN_VERB}\\command", association.prog_id)),
+            &classes_path(&format!(
+                "{}\\shell\\{OPEN_VERB}\\command",
+                association.prog_id
+            )),
             &command,
         )?;
 
-        let extension_path = classes_path(association.extension);
-        changed |= ensure_default_string_value(&extension_path, association.prog_id)?;
+        let extension_path = classes_path(&association.extension);
+        changed |= ensure_default_string_value(&extension_path, &association.prog_id)?;
     }
 
     if changed {
@@ -89,6 +76,52 @@ pub fn ensure_file_associations() -> io::Result<()> {
     }
 
     Ok(())
+}
+
+pub fn file_association_specs() -> Vec<FileAssociationSpec> {
+    let mut specs = builtin_registry()
+        .descriptors()
+        .iter()
+        .flat_map(|descriptor| {
+            let native_specs = descriptor
+                .extensions
+                .iter()
+                .map(|extension| FileAssociationSpec {
+                    extension: format!(".{extension}"),
+                    prog_id: format!("flutzplayer.{extension}"),
+                    friendly_type_name: format_friendly_type_name(descriptor.friendly_name, false),
+                });
+            let wrapped_specs =
+                descriptor
+                    .wrapped_extensions
+                    .iter()
+                    .map(|extension| FileAssociationSpec {
+                        extension: format!(".{extension}"),
+                        prog_id: format!("flutzplayer.{extension}"),
+                        friendly_type_name: format_friendly_type_name(
+                            descriptor.friendly_name,
+                            true,
+                        ),
+                    });
+            native_specs.chain(wrapped_specs).collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    specs.push(FileAssociationSpec {
+        extension: ".fplist".to_owned(),
+        prog_id: "flutzplayer.fplist".to_owned(),
+        friendly_type_name: "flutzPlayer Playlist".to_owned(),
+    });
+    specs.sort_by(|left, right| left.extension.cmp(&right.extension));
+    specs.dedup_by(|left, right| left.extension == right.extension);
+    specs
+}
+
+fn format_friendly_type_name(base_name: &str, is_wrapped: bool) -> String {
+    if is_wrapped {
+        format!("flutzPlayer {} wrapper", base_name)
+    } else {
+        base_name.to_owned()
+    }
 }
 
 fn classes_path(suffix: &str) -> String {

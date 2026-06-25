@@ -1,7 +1,13 @@
 use std::{
+    collections::{BTreeMap, BTreeSet},
     fmt::Write as _,
     fs,
     path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc, Arc,
+    },
+    thread,
     time::{Duration, Instant},
 };
 
@@ -14,9 +20,19 @@ use flutz_fmid::{
     ProjectRecord as FmidProjectRecord, SmartMixRecord as FmidSmartMixRecord,
     SoundFontRowMuteRecord, SoundFontSlot,
 };
+use flutz_formats::{
+    builtin_registry, read_flutz_wrapper, write_flutz_wrapper, ContentKind,
+    read_track_metadata_with_symphonia, DecodedAudioStreamSource, FlutzAudioWrapper,
+    FormatDescriptor, LoopMode as MediaLoopMode, LoopUnit, MasteringCapability, MediaLoop,
+    MetadataField, NativeMetadata, SourceAudioBlock, TrackMetadata,
+};
 use flutz_mixer::{
     effects::LimiterControls, AutoNormalization, MasterControls as MixerMasterControls,
     MixerSettings, MixerStripControls, SmartMixSettings,
+};
+use flutz_peq::{
+    deserialize_preset_toml, load_preset_file, save_preset_file, Bandwidth, ChannelLayout,
+    PeqBandConfig, PeqConfig, PeqPresetFile, PresetMetadata,
 };
 use flutz_synth::{PlaybackLoopMode, PlaybackLoopSettings, SoundFontCoverage};
 use flutz_visualizer_core::VisualizerFrame;
@@ -34,8 +50,10 @@ use crate::playlist::{
 use crate::routing::compute_strip_routing;
 
 const IDLE_MEMORY_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(5);
+const PLAYLIST_PRELOAD_LEAD_TIME_SECONDS: f64 = 3.0;
 
-use std::collections::{BTreeMap, BTreeSet};
+static DECODED_AUDIO_LOAD_TOKEN: AtomicU64 = AtomicU64::new(0);
+static PLAYLIST_PRELOAD_TOKEN: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
 pub enum AppRunState {
@@ -110,6 +128,7 @@ pub struct FlutzDesktopApp {
     speaker_volume_popup_open: bool,
     final_output_volume_percent: f32,
     release_loop_popup_open: bool,
+    loaded_content: Option<LoadedContentState>,
     project_title: String,
     current_path: Option<String>,
     dirty: bool,
@@ -128,6 +147,8 @@ pub struct FlutzDesktopApp {
     active_preset_id: String,
     selected_preset_id: String,
     default_preset_id: String,
+    default_decoded_peq_preset: PeqPresetFile,
+    decoded_peq_bypass_enabled: bool,
     coverage_cache: BTreeMap<String, SoundFontCoverage>,
     selected_soundfont: usize,
     mixer_assignment_mode: MixerAssignmentMode,
@@ -149,14 +170,485 @@ pub struct FlutzDesktopApp {
     metadata_popup_open: bool,
     metadata_edit_dirty: bool,
     metadata_edit_state: MetadataEditState,
+    peq_edit_state: PeqEditState,
+    pending_decoded_audio_load: Option<PendingDecodedAudioLoad>,
+    pending_playlist_preload: Option<PendingPlaylistPreload>,
+    ready_playlist_preload: Option<ReadyPlaylistPreload>,
     last_playback_active: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MetadataEditState {
     pub project_name: String,
-    pub source_midi_filename: String,
+    pub source_filename: String,
+    pub artist: String,
+    pub album: String,
+    pub album_artist: String,
+    pub composer: String,
+    pub conductor: String,
+    pub genre: String,
+    pub date: String,
+    pub track_number: String,
+    pub track_total: String,
+    pub disc_number: String,
+    pub disc_total: String,
+    pub description: String,
+    pub copyright: String,
+    pub publisher: String,
+    pub encoded_by: String,
+    pub encoder: String,
+    pub language: String,
+    pub lyrics: String,
+    pub url: String,
     pub notes: String,
+    pub extra_fields: Vec<MetadataField>,
+    pub native_metadata: NativeMetadata,
+    pub supports_native_metadata: bool,
+}
+
+impl MetadataEditState {
+    fn from_track_metadata(
+        metadata: &TrackMetadata,
+        fallback_project_name: String,
+        fallback_source_filename: String,
+    ) -> Self {
+        Self {
+            project_name: if metadata.project_name.trim().is_empty() {
+                fallback_project_name
+            } else {
+                metadata.project_name.clone()
+            },
+            source_filename: if metadata.source_filename.trim().is_empty() {
+                fallback_source_filename
+            } else {
+                metadata.source_filename.clone()
+            },
+            artist: metadata.artist.clone(),
+            album: metadata.album.clone(),
+            album_artist: metadata.album_artist.clone(),
+            composer: metadata.composer.clone(),
+            conductor: metadata.conductor.clone(),
+            genre: metadata.genre.clone(),
+            date: metadata.date.clone(),
+            track_number: metadata.track_number.clone(),
+            track_total: metadata.track_total.clone(),
+            disc_number: metadata.disc_number.clone(),
+            disc_total: metadata.disc_total.clone(),
+            description: metadata.description.clone(),
+            copyright: metadata.copyright.clone(),
+            publisher: metadata.publisher.clone(),
+            encoded_by: metadata.encoded_by.clone(),
+            encoder: metadata.encoder.clone(),
+            language: metadata.language.clone(),
+            lyrics: metadata.lyrics.clone(),
+            url: metadata.url.clone(),
+            notes: metadata.notes.clone(),
+            extra_fields: metadata.extra_fields.clone(),
+            native_metadata: Vec::new(),
+            supports_native_metadata: false,
+        }
+    }
+
+    fn from_fmid_project(
+        project: &FmidProjectRecord,
+        fallback_project_name: String,
+        fallback_source_filename: String,
+    ) -> Self {
+        Self {
+            project_name: if project.project_name.trim().is_empty() {
+                fallback_project_name
+            } else {
+                project.project_name.clone()
+            },
+            source_filename: if project.source_midi_filename.trim().is_empty() {
+                fallback_source_filename
+            } else {
+                project.source_midi_filename.clone()
+            },
+            artist: project.artist.clone(),
+            album: project.album.clone(),
+            album_artist: project.album_artist.clone(),
+            composer: project.composer.clone(),
+            conductor: project.conductor.clone(),
+            genre: project.genre.clone(),
+            date: project.date.clone(),
+            track_number: project.track_number.clone(),
+            track_total: project.track_total.clone(),
+            disc_number: project.disc_number.clone(),
+            disc_total: project.disc_total.clone(),
+            description: project.description.clone(),
+            copyright: project.copyright.clone(),
+            publisher: project.publisher.clone(),
+            encoded_by: project.encoded_by.clone(),
+            encoder: project.encoder.clone(),
+            language: project.language.clone(),
+            lyrics: project.lyrics.clone(),
+            url: project.url.clone(),
+            notes: project.notes.clone(),
+            extra_fields: project
+                .extra_fields
+                .iter()
+                .map(|(key, value)| MetadataField {
+                    key: key.clone(),
+                    value: value.clone(),
+                })
+                .collect(),
+            native_metadata: Vec::new(),
+            supports_native_metadata: false,
+        }
+    }
+
+    fn with_native_metadata(mut self, native_metadata: NativeMetadata) -> Self {
+        self.native_metadata = native_metadata;
+        self.supports_native_metadata = true;
+        self
+    }
+
+    fn to_track_metadata(
+        &self,
+        fallback_project_name: &str,
+        fallback_source_filename: &str,
+    ) -> TrackMetadata {
+        TrackMetadata {
+            project_name: first_non_empty(&self.project_name, fallback_project_name),
+            source_filename: first_non_empty(&self.source_filename, fallback_source_filename),
+            artist: self.artist.clone(),
+            album: self.album.clone(),
+            album_artist: self.album_artist.clone(),
+            composer: self.composer.clone(),
+            conductor: self.conductor.clone(),
+            genre: self.genre.clone(),
+            date: self.date.clone(),
+            track_number: self.track_number.clone(),
+            track_total: self.track_total.clone(),
+            disc_number: self.disc_number.clone(),
+            disc_total: self.disc_total.clone(),
+            description: self.description.clone(),
+            copyright: self.copyright.clone(),
+            publisher: self.publisher.clone(),
+            encoded_by: self.encoded_by.clone(),
+            encoder: self.encoder.clone(),
+            language: self.language.clone(),
+            lyrics: self.lyrics.clone(),
+            url: self.url.clone(),
+            notes: self.notes.clone(),
+            extra_fields: normalized_metadata_fields(&self.extra_fields),
+        }
+    }
+
+    fn to_fmid_project(
+        &self,
+        fallback_project_name: &str,
+        fallback_source_filename: &str,
+    ) -> FmidProjectRecord {
+        FmidProjectRecord {
+            project_name: first_non_empty(&self.project_name, fallback_project_name),
+            source_midi_filename: first_non_empty(&self.source_filename, fallback_source_filename),
+            artist: self.artist.clone(),
+            album: self.album.clone(),
+            album_artist: self.album_artist.clone(),
+            composer: self.composer.clone(),
+            conductor: self.conductor.clone(),
+            genre: self.genre.clone(),
+            date: self.date.clone(),
+            track_number: self.track_number.clone(),
+            track_total: self.track_total.clone(),
+            disc_number: self.disc_number.clone(),
+            disc_total: self.disc_total.clone(),
+            description: self.description.clone(),
+            copyright: self.copyright.clone(),
+            publisher: self.publisher.clone(),
+            encoded_by: self.encoded_by.clone(),
+            encoder: self.encoder.clone(),
+            language: self.language.clone(),
+            lyrics: self.lyrics.clone(),
+            url: self.url.clone(),
+            project_flags: 0,
+            notes: self.notes.clone(),
+            extra_fields: normalized_metadata_fields(&self.extra_fields)
+                .into_iter()
+                .map(|field| (field.key, field.value))
+                .collect(),
+        }
+    }
+}
+
+fn first_non_empty(primary: &str, fallback: &str) -> String {
+    if primary.trim().is_empty() {
+        fallback.to_owned()
+    } else {
+        primary.to_owned()
+    }
+}
+
+fn normalized_metadata_fields(fields: &[MetadataField]) -> Vec<MetadataField> {
+    fields
+        .iter()
+        .filter_map(|field| {
+            let key = field.key.trim();
+            let value = field.value.trim();
+            if key.is_empty() && value.is_empty() {
+                None
+            } else {
+                Some(MetadataField {
+                    key: key.to_owned(),
+                    value: value.to_owned(),
+                })
+            }
+        })
+        .collect()
+}
+
+fn draw_metadata_text_field(ui: &mut egui::Ui, label: &str, value: &mut String) -> bool {
+    ui.label(label);
+    ui.text_edit_singleline(value).changed()
+}
+
+fn draw_metadata_multiline_field(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut String,
+    rows: usize,
+) -> bool {
+    ui.label(label);
+    ui.add(egui::TextEdit::multiline(value).desired_rows(rows))
+        .changed()
+}
+
+fn draw_metadata_field_list(
+    ui: &mut egui::Ui,
+    heading: &str,
+    add_label: &str,
+    fields: &mut Vec<MetadataField>,
+) -> bool {
+    let mut changed = false;
+    ui.label(heading);
+    let mut remove_index = None;
+    for (index, field) in fields.iter_mut().enumerate() {
+        ui.push_id((heading, index), |ui| {
+            ui.horizontal(|ui| {
+                changed |= ui.text_edit_singleline(&mut field.key).changed();
+                changed |= ui.text_edit_singleline(&mut field.value).changed();
+                if ui.button("x").clicked() {
+                    remove_index = Some(index);
+                }
+            });
+        });
+    }
+    if let Some(index) = remove_index {
+        fields.remove(index);
+        changed = true;
+    }
+    if ui.button(add_label).clicked() {
+        fields.push(MetadataField::default());
+        changed = true;
+    }
+    changed
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct LoadedContentState {
+    kind: ContentKind,
+    format_id: String,
+    friendly_name: String,
+    mastering: MasteringCapability,
+    wrapped_extension: Option<String>,
+    decoded_wrapper: Option<FlutzAudioWrapper>,
+    decoded_source_path: Option<PathBuf>,
+    decoded_source_bytes: Option<Arc<[u8]>>,
+}
+
+struct PendingDecodedAudioLoad {
+    token: u64,
+    receiver: mpsc::Receiver<DecodedAudioLoadJobResult>,
+    resume_after_load: bool,
+    playlist_entry_load: bool,
+}
+
+struct PendingPlaylistPreload {
+    token: u64,
+    index: usize,
+    path: PathBuf,
+    receiver: mpsc::Receiver<DecodedAudioLoadJobResult>,
+}
+
+struct ReadyPlaylistPreload {
+    token: u64,
+    index: usize,
+    path: PathBuf,
+    result: DecodedAudioLoadJobResult,
+}
+
+struct DecodedAudioLoadJobResult {
+    token: u64,
+    path: PathBuf,
+    path_display: String,
+    descriptor: FormatDescriptor,
+    is_wrapped: bool,
+    wrapper: Option<FlutzAudioWrapper>,
+    stream_source: Option<DecodedAudioStreamSource>,
+    source_bytes: Option<Arc<[u8]>>,
+    error: Option<String>,
+    error_stage: &'static str,
+}
+
+fn prepare_decoded_audio_load_job(
+    token: u64,
+    path: PathBuf,
+    descriptor: FormatDescriptor,
+) -> DecodedAudioLoadJobResult {
+    let path_display = path.display().to_string();
+    let extension = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase());
+    let is_wrapped = extension.as_deref().is_some_and(|ext| {
+        descriptor
+            .wrapped_extensions
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(ext))
+    });
+    let mut result = DecodedAudioLoadJobResult {
+        token,
+        path: path.clone(),
+        path_display,
+        descriptor,
+        is_wrapped,
+        wrapper: None,
+        stream_source: None,
+        source_bytes: None,
+        error: None,
+        error_stage: "prepare",
+    };
+
+    if is_wrapped {
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                result.error = Some(format!("failed to read {}: {error}", path.display()));
+                result.error_stage = "read";
+                return result;
+            }
+        };
+        let mut wrapper = match read_flutz_wrapper(&bytes) {
+            Ok(wrapper) => wrapper,
+            Err(error) => {
+                result.error = Some(format!("{error}"));
+                result.error_stage = "parse";
+                return result;
+            }
+        };
+        let hint_extension = Path::new(&wrapper.source.original_filename)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(str::to_owned)
+            .or_else(|| descriptor.extensions.first().map(|ext| (*ext).to_owned()));
+        let source_bytes = Arc::<[u8]>::from(std::mem::take(&mut wrapper.source.bytes));
+        result.stream_source = Some(DecodedAudioStreamSource::Bytes {
+            bytes: Arc::clone(&source_bytes),
+            hint_extension,
+        });
+        result.source_bytes = Some(source_bytes);
+        result.wrapper = Some(wrapper);
+        return result;
+    }
+
+    let source_filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("embedded.audio")
+        .to_owned();
+    let fallback_project_name = path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or(&source_filename)
+        .to_owned();
+    let (metadata, native_metadata) = read_track_metadata_with_symphonia(
+        DecodedAudioStreamSource::Path(path.clone()),
+        descriptor.id,
+        &fallback_project_name,
+        &source_filename,
+    )
+    .unwrap_or_else(|_| {
+        (
+            TrackMetadata {
+                project_name: fallback_project_name.clone(),
+                source_filename: source_filename.clone(),
+                ..TrackMetadata::default()
+            },
+            Vec::new(),
+        )
+    });
+    result.wrapper = Some(FlutzAudioWrapper {
+        source: SourceAudioBlock {
+            format_id: descriptor.id.to_owned(),
+            original_filename: source_filename.clone(),
+            media_type: format!("audio/{}", descriptor.id),
+            bytes: Vec::new(),
+        },
+        metadata,
+        native_metadata,
+        ..FlutzAudioWrapper::default()
+    });
+    result.stream_source = Some(DecodedAudioStreamSource::Path(path));
+    result
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct PeqEditState {
+    preset: PeqPresetFile,
+    source: PeqConfigSource,
+    preset_path: Option<PathBuf>,
+    dirty: bool,
+}
+
+impl Default for PeqEditState {
+    fn default() -> Self {
+        Self {
+            preset: default_decoded_peq_preset(48_000, 2),
+            source: PeqConfigSource::Inactive,
+            preset_path: None,
+            dirty: false,
+        }
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum PeqConfigSource {
+    Inactive,
+    Wrapper,
+    Default,
+    PresetFile,
+    BuiltInPreset,
+}
+
+impl PeqConfigSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Inactive => "No decoded audio",
+            Self::Wrapper => "Embedded",
+            Self::Default => "Default",
+            Self::PresetFile => "Preset file",
+            Self::BuiltInPreset => "Built-in preset",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct DecodedAudioPeqPreferences {
+    #[serde(default)]
+    bypass: bool,
+    #[serde(default = "default_preferences_default_peq_preset")]
+    default_preset: PeqPresetFile,
+}
+
+impl Default for DecodedAudioPeqPreferences {
+    fn default() -> Self {
+        Self {
+            bypass: false,
+            default_preset: default_preferences_default_peq_preset(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -193,6 +685,8 @@ struct PreferencesFile {
     #[serde(default = "default_preferences_default_preset_id")]
     default_preset_id: String,
     #[serde(default)]
+    decoded_audio_peq: DecodedAudioPeqPreferences,
+    #[serde(default)]
     window: WindowViewPrefs,
 }
 
@@ -200,6 +694,7 @@ impl Default for PreferencesFile {
     fn default() -> Self {
         Self {
             default_preset_id: default_preferences_default_preset_id(),
+            decoded_audio_peq: DecodedAudioPeqPreferences::default(),
             window: WindowViewPrefs::default(),
         }
     }
@@ -207,6 +702,10 @@ impl Default for PreferencesFile {
 
 fn default_preferences_default_preset_id() -> String {
     default_preset_set().default_preset().id.to_owned()
+}
+
+fn default_preferences_default_peq_preset() -> PeqPresetFile {
+    normalize_default_decoded_peq_preset(load_builtin_decoded_peq_preset("Default"))
 }
 
 impl FlutzDesktopApp {
@@ -230,7 +729,9 @@ impl FlutzDesktopApp {
             DatStartupSummary::Unavailable(message) => message.clone(),
         };
         let preset_set = default_preset_set();
-        let preferences = Self::load_or_create_preferences_from_data_dir(&config.data_dir, preset_set);
+        let preferences =
+            Self::load_or_create_preferences_from_data_dir(&config.data_dir, preset_set);
+        let default_decoded_peq_preset = preferences.decoded_audio_peq.default_preset.clone();
         let default_preset = preset_set
             .find_preset(&preferences.default_preset_id)
             .unwrap_or_else(|| preset_set.default_preset());
@@ -249,6 +750,7 @@ impl FlutzDesktopApp {
             speaker_volume_popup_open: false,
             final_output_volume_percent: 0.0,
             release_loop_popup_open: false,
+            loaded_content: None,
             project_title: "Untitled MIDI".to_owned(),
             current_path: None,
             dirty: false,
@@ -267,6 +769,8 @@ impl FlutzDesktopApp {
             active_preset_id: default_preset.id.to_owned(),
             selected_preset_id: default_preset.id.to_owned(),
             default_preset_id: default_preset.id.to_owned(),
+            default_decoded_peq_preset,
+            decoded_peq_bypass_enabled: preferences.decoded_audio_peq.bypass,
             coverage_cache: BTreeMap::new(),
             selected_soundfont: 0,
             mixer_assignment_mode: MixerAssignmentMode::Manual,
@@ -301,6 +805,10 @@ impl FlutzDesktopApp {
             metadata_popup_open: preferences.window.metadata_open,
             metadata_edit_dirty: false,
             metadata_edit_state: MetadataEditState::default(),
+            peq_edit_state: PeqEditState::default(),
+            pending_decoded_audio_load: None,
+            pending_playlist_preload: None,
+            ready_playlist_preload: None,
             last_playback_active: false,
         };
 
@@ -310,9 +818,8 @@ impl FlutzDesktopApp {
                 .extension()
                 .and_then(|ext| ext.to_str())
                 .map(|ext| ext.to_ascii_lowercase());
-            app.open_project_path(path);
+            app.open_project_path_with_resume(path, true);
             if app.has_loaded_project() && app.run_state != AppRunState::Playing {
-                app.play();
                 if startup_extension.as_deref() != Some("fplist") {
                     app.regenerate_playlist_with_single_entry(startup_path, true);
                 }
@@ -337,14 +844,27 @@ impl FlutzDesktopApp {
 
         if let Ok(text) = fs::read_to_string(&path) {
             if let Ok(preferences) = toml::from_str::<PreferencesFile>(&text) {
+                let preferences = Self::normalize_preferences(preferences);
+                let rendered = Self::render_preferences_file(&preferences, preset_set);
+                if rendered != text {
+                    let _ = fs::write(&path, rendered);
+                }
                 return preferences;
             }
 
-            return PreferencesFile::default();
+            let preferences = Self::normalize_preferences(PreferencesFile::default());
+            let _ = fs::write(
+                &path,
+                Self::render_preferences_file(&preferences, preset_set),
+            );
+            return preferences;
         }
 
-        let preferences = PreferencesFile::default();
-        let _ = fs::write(&path, Self::render_preferences_file(&preferences, preset_set));
+        let preferences = Self::normalize_preferences(PreferencesFile::default());
+        let _ = fs::write(
+            &path,
+            Self::render_preferences_file(&preferences, preset_set),
+        );
         preferences
     }
 
@@ -362,37 +882,48 @@ impl FlutzDesktopApp {
     ) -> String {
         let mut output = String::new();
         writeln!(&mut output, "# flutzPlayer preferences").unwrap();
-        writeln!(&mut output, "# Edit this file directly. TOML format is used so comments are preserved.").unwrap();
+        writeln!(
+            &mut output,
+            "# Edit this file directly. TOML format is used so comments are preserved."
+        )
+        .unwrap();
         writeln!(&mut output).unwrap();
-        writeln!(&mut output, "# default_preset_id selects the multifont preset used when opening plain MIDI files.").unwrap();
+        writeln!(
+            &mut output,
+            "# default_preset_id selects the multifont preset used when opening plain MIDI files."
+        )
+        .unwrap();
         writeln!(&mut output, "# Available preset ids:").unwrap();
         for preset in preset_set.presets {
             writeln!(&mut output, "# - {} ({})", preset.id, preset.display_name).unwrap();
         }
-        let default_preset_id = toml::Value::String(preferences.default_preset_id.clone());
-        writeln!(
-            &mut output,
-            "default_preset_id = {}",
-            default_preset_id
-        )
-        .unwrap();
+        writeln!(&mut output, "# decoded_audio_peq.default_preset stores the optional default decoded-audio PEQ config.").unwrap();
+        writeln!(&mut output, "# decoded_audio_peq.bypass persists the global Bypass EQ toggle.").unwrap();
         writeln!(&mut output).unwrap();
-        writeln!(&mut output, "[window]").unwrap();
-        writeln!(&mut output, "playlist_open = {}", preferences.window.playlist_open).unwrap();
-        writeln!(&mut output, "metadata_open = {}", preferences.window.metadata_open).unwrap();
-        if let Some(position) = preferences.window.playlist_position {
-            writeln!(&mut output, "playlist_position = [{:?}, {:?}]", position[0], position[1]).unwrap();
-        }
-        if let Some(size) = preferences.window.playlist_size {
-            writeln!(&mut output, "playlist_size = [{:?}, {:?}]", size[0], size[1]).unwrap();
-        }
-        if let Some(position) = preferences.window.metadata_position {
-            writeln!(&mut output, "metadata_position = [{:?}, {:?}]", position[0], position[1]).unwrap();
-        }
-        if let Some(size) = preferences.window.metadata_size {
-            writeln!(&mut output, "metadata_size = [{:?}, {:?}]", size[0], size[1]).unwrap();
-        }
+        output.push_str(
+            &toml::to_string_pretty(preferences)
+                .expect("preferences serialization should succeed"),
+        );
         output
+    }
+
+    fn normalize_preferences(mut preferences: PreferencesFile) -> PreferencesFile {
+        preferences.decoded_audio_peq.default_preset =
+            normalize_default_decoded_peq_preset(preferences.decoded_audio_peq.default_preset);
+        preferences
+    }
+
+    fn build_preferences(&self) -> PreferencesFile {
+        PreferencesFile {
+            default_preset_id: self.default_preset_id.clone(),
+            decoded_audio_peq: DecodedAudioPeqPreferences {
+                bypass: self.decoded_peq_bypass_enabled,
+                default_preset: normalize_default_decoded_peq_preset(
+                    self.default_decoded_peq_preset.clone(),
+                ),
+            },
+            window: self.window_view_prefs.clone(),
+        }
     }
 
     fn persist_window_view_prefs(&self) {
@@ -400,11 +931,11 @@ impl FlutzDesktopApp {
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        let preferences = PreferencesFile {
-            default_preset_id: self.default_preset_id.clone(),
-            window: self.window_view_prefs.clone(),
-        };
-        let _ = fs::write(path, Self::render_preferences_file(&preferences, self.preset_set));
+        let preferences = self.build_preferences();
+        let _ = fs::write(
+            path,
+            Self::render_preferences_file(&preferences, self.preset_set),
+        );
     }
 
     fn set_playlist_window_open(&mut self, open: bool) {
@@ -528,7 +1059,10 @@ impl eframe::App for FlutzDesktopApp {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         let _allocation_scope = AllocationScopeGuard::enter(AllocationScope::AppUpdate);
         self.process_playlist_file_picker_pending();
+        self.process_pending_decoded_audio_load();
+        self.process_pending_playlist_preload();
         self.refresh_realtime_feedback();
+        self.maybe_start_playlist_preload();
         let mixer_snapshot = self.mixer_edit_snapshot();
         {
             let _allocation_scope = AllocationScopeGuard::enter(AllocationScope::Ui);
@@ -907,11 +1441,11 @@ impl FlutzDesktopApp {
         let mut builder = egui::ViewportBuilder::default()
             .with_title("Metadata")
             .with_resizable(true)
-            .with_min_inner_size(egui::vec2(360.0, 240.0));
+            .with_min_inner_size(egui::vec2(720.0, 240.0));
         if let Some(size) = self.window_view_prefs.metadata_size {
             builder = builder.with_inner_size(egui::vec2(size[0], size[1]));
         } else {
-            builder = builder.with_inner_size(egui::vec2(480.0, 320.0));
+            builder = builder.with_inner_size(egui::vec2(920.0, 320.0));
         }
         if let Some(position) = self.window_view_prefs.metadata_position {
             builder = builder.with_position(egui::pos2(position[0], position[1]));
@@ -955,7 +1489,10 @@ impl FlutzDesktopApp {
                 .as_ref()
                 .and_then(|playlist| playlist.file_path.as_ref())
                 .is_some();
-            if ui.add_enabled(can_save, egui::Button::new("Save")).clicked() {
+            if ui
+                .add_enabled(can_save, egui::Button::new("Save"))
+                .clicked()
+            {
                 self.save_playlist();
             }
 
@@ -1007,16 +1544,8 @@ impl FlutzDesktopApp {
                             PlaylistOrderMode::Sequential,
                             "Sequential",
                         );
-                        ui.selectable_value(
-                            &mut order_mode,
-                            PlaylistOrderMode::Shuffle,
-                            "Shuffle",
-                        );
-                        ui.selectable_value(
-                            &mut order_mode,
-                            PlaylistOrderMode::Random,
-                            "Random",
-                        );
+                        ui.selectable_value(&mut order_mode, PlaylistOrderMode::Shuffle, "Shuffle");
+                        ui.selectable_value(&mut order_mode, PlaylistOrderMode::Random, "Random");
                     });
                 if order_mode != playlist.order_mode {
                     playlist.set_order_mode(order_mode);
@@ -1030,7 +1559,11 @@ impl FlutzDesktopApp {
                         PlaylistRepeatMode::Playlist => "Repeat Playlist",
                     })
                     .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut repeat_mode, PlaylistRepeatMode::Off, "Repeat Off");
+                        ui.selectable_value(
+                            &mut repeat_mode,
+                            PlaylistRepeatMode::Off,
+                            "Repeat Off",
+                        );
                         ui.selectable_value(
                             &mut repeat_mode,
                             PlaylistRepeatMode::Track,
@@ -1139,36 +1672,160 @@ impl FlutzDesktopApp {
     }
 
     pub(crate) fn draw_metadata_window_contents(&mut self, ui: &mut egui::Ui) {
-        ui.label("Project Title");
-        if ui
-            .text_edit_singleline(&mut self.metadata_edit_state.project_name)
-            .changed()
-        {
+        let mut changed = false;
+        let button_row_height = ui.spacing().interact_size.y + ui.spacing().item_spacing.y * 3.0;
+        let scroll_height = (ui.available_height() - button_row_height).max(0.0);
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .max_height(scroll_height)
+            .show(ui, |ui| {
+                ui.columns(2, |columns| {
+                    changed |= draw_metadata_text_field(
+                        &mut columns[0],
+                        "Project Title",
+                        &mut self.metadata_edit_state.project_name,
+                    );
+                    changed |= draw_metadata_text_field(
+                        &mut columns[0],
+                        "Source Filename",
+                        &mut self.metadata_edit_state.source_filename,
+                    );
+                    columns[0].separator();
+                    columns[0].label("Tagged Metadata");
+                    changed |= draw_metadata_text_field(
+                        &mut columns[0],
+                        "Artist",
+                        &mut self.metadata_edit_state.artist,
+                    );
+                    changed |= draw_metadata_text_field(
+                        &mut columns[0],
+                        "Album",
+                        &mut self.metadata_edit_state.album,
+                    );
+                    changed |= draw_metadata_text_field(
+                        &mut columns[0],
+                        "Album Artist",
+                        &mut self.metadata_edit_state.album_artist,
+                    );
+                    changed |= draw_metadata_text_field(
+                        &mut columns[0],
+                        "Composer",
+                        &mut self.metadata_edit_state.composer,
+                    );
+                    changed |= draw_metadata_text_field(
+                        &mut columns[0],
+                        "Conductor",
+                        &mut self.metadata_edit_state.conductor,
+                    );
+                    changed |= draw_metadata_text_field(
+                        &mut columns[0],
+                        "Genre",
+                        &mut self.metadata_edit_state.genre,
+                    );
+                    changed |= draw_metadata_text_field(
+                        &mut columns[0],
+                        "Date",
+                        &mut self.metadata_edit_state.date,
+                    );
+                    changed |= draw_metadata_text_field(
+                        &mut columns[0],
+                        "Track Number",
+                        &mut self.metadata_edit_state.track_number,
+                    );
+                    changed |= draw_metadata_text_field(
+                        &mut columns[0],
+                        "Track Total",
+                        &mut self.metadata_edit_state.track_total,
+                    );
+
+                    changed |= draw_metadata_text_field(
+                        &mut columns[1],
+                        "Disc Number",
+                        &mut self.metadata_edit_state.disc_number,
+                    );
+                    changed |= draw_metadata_text_field(
+                        &mut columns[1],
+                        "Disc Total",
+                        &mut self.metadata_edit_state.disc_total,
+                    );
+                    changed |= draw_metadata_multiline_field(
+                        &mut columns[1],
+                        "Description",
+                        &mut self.metadata_edit_state.description,
+                        3,
+                    );
+                    changed |= draw_metadata_text_field(
+                        &mut columns[1],
+                        "Copyright",
+                        &mut self.metadata_edit_state.copyright,
+                    );
+                    changed |= draw_metadata_text_field(
+                        &mut columns[1],
+                        "Publisher",
+                        &mut self.metadata_edit_state.publisher,
+                    );
+                    changed |= draw_metadata_text_field(
+                        &mut columns[1],
+                        "Encoded By",
+                        &mut self.metadata_edit_state.encoded_by,
+                    );
+                    changed |= draw_metadata_text_field(
+                        &mut columns[1],
+                        "Encoder",
+                        &mut self.metadata_edit_state.encoder,
+                    );
+                    changed |= draw_metadata_text_field(
+                        &mut columns[1],
+                        "Language",
+                        &mut self.metadata_edit_state.language,
+                    );
+                    changed |= draw_metadata_multiline_field(
+                        &mut columns[1],
+                        "Lyrics",
+                        &mut self.metadata_edit_state.lyrics,
+                        4,
+                    );
+                    changed |= draw_metadata_text_field(
+                        &mut columns[1],
+                        "URL",
+                        &mut self.metadata_edit_state.url,
+                    );
+                    changed |= draw_metadata_multiline_field(
+                        &mut columns[1],
+                        "Notes",
+                        &mut self.metadata_edit_state.notes,
+                        6,
+                    );
+                });
+
+                ui.separator();
+                changed |= draw_metadata_field_list(
+                    ui,
+                    "Additional Fields",
+                    "Add Field",
+                    &mut self.metadata_edit_state.extra_fields,
+                );
+
+                if self.metadata_edit_state.supports_native_metadata {
+                    ui.separator();
+                    changed |= draw_metadata_field_list(
+                        ui,
+                        "Native Audio Tags",
+                        "Add Native Tag",
+                        &mut self.metadata_edit_state.native_metadata,
+                    );
+                }
+            });
+
+        if changed {
             self.project_title = self.metadata_edit_state.project_name.clone();
-            self.metadata_edit_dirty = true;
-            self.mark_dirty();
-        }
-
-        ui.label("Source MIDI Filename");
-        if ui
-            .text_edit_singleline(&mut self.metadata_edit_state.source_midi_filename)
-            .changed()
-        {
-            self.metadata_edit_dirty = true;
-            self.mark_dirty();
-        }
-
-        ui.label("NOTES");
-        if ui
-            .add(egui::TextEdit::multiline(&mut self.metadata_edit_state.notes).desired_rows(8))
-            .changed()
-        {
             self.metadata_edit_dirty = true;
             self.mark_dirty();
         }
 
         ui.horizontal(|ui| {
             if ui.button("Apply").clicked() {
+                self.project_title = self.metadata_edit_state.project_name.clone();
                 self.metadata_edit_dirty = true;
                 self.mark_dirty();
             }
@@ -1280,10 +1937,102 @@ impl FlutzDesktopApp {
         self.current_path.is_some()
     }
 
+    pub fn active_mastering_capability(&self) -> MasteringCapability {
+        self.loaded_content
+            .as_ref()
+            .map(|content| content.mastering)
+            .unwrap_or(MasteringCapability::None)
+    }
+
+    pub fn active_content_kind(&self) -> Option<ContentKind> {
+        self.loaded_content.as_ref().map(|content| content.kind)
+    }
+
+    pub fn transport_unit_label(&self) -> &'static str {
+        match self.active_content_kind() {
+            Some(ContentKind::DecodedAudio | ContentKind::DecodedAudioWrapper) => "sample-frames",
+            Some(ContentKind::Midi | ContentKind::Fmid) => "ticks",
+            None => "ticks",
+        }
+    }
+
+    pub fn transport_unit_prefix(&self) -> &'static str {
+        match self.active_content_kind() {
+            Some(ContentKind::DecodedAudio | ContentKind::DecodedAudioWrapper) => "f:",
+            Some(ContentKind::Midi | ContentKind::Fmid) => "t:",
+            None => "t:",
+        }
+    }
+
+    pub fn decoded_peq_config(&self) -> &PeqConfig {
+        &self.peq_edit_state.preset.config
+    }
+
+    pub fn decoded_peq_config_source(&self) -> PeqConfigSource {
+        self.peq_edit_state.source
+    }
+
+    pub fn decoded_peq_bypass_enabled(&self) -> bool {
+        self.decoded_peq_bypass_enabled
+    }
+
+    pub fn decoded_peq_preset_display_name(&self) -> String {
+        let base = match self.peq_edit_state.source {
+            PeqConfigSource::Inactive => "No decoded audio".to_owned(),
+            PeqConfigSource::Wrapper => "Embedded".to_owned(),
+            PeqConfigSource::Default => "Default".to_owned(),
+            PeqConfigSource::PresetFile => self
+                .peq_edit_state
+                .preset
+                .metadata
+                .name
+                .clone()
+                .or_else(|| {
+                    self.peq_edit_state.preset_path.as_ref().and_then(|path| {
+                        path.file_stem()
+                            .and_then(|stem| stem.to_str())
+                            .map(str::to_owned)
+                    })
+                })
+                .unwrap_or_else(|| "Preset".to_owned()),
+            PeqConfigSource::BuiltInPreset => self
+                .peq_edit_state
+                .preset
+                .metadata
+                .name
+                .clone()
+                .unwrap_or_else(|| "Built-in".to_owned()),
+        };
+        if self.peq_edit_state.dirty {
+            format!("{base}*")
+        } else {
+            base
+        }
+    }
+
+    pub fn builtin_decoded_peq_preset_names(&self) -> &'static [&'static str] {
+        builtin_decoded_peq_preset_names()
+    }
+
+    pub fn decoded_peq_preset_path_label(&self) -> String {
+        match self.peq_edit_state.source {
+            PeqConfigSource::Inactive => "No decoded audio loaded".to_owned(),
+            PeqConfigSource::Wrapper => "Embedded in current media file".to_owned(),
+            PeqConfigSource::Default => "Stored in preferences.ini".to_owned(),
+            PeqConfigSource::PresetFile => self
+                .peq_edit_state
+                .preset_path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "Preset file".to_owned()),
+            PeqConfigSource::BuiltInPreset => "Bundled with flutzPlayer".to_owned(),
+        }
+    }
+
     pub fn open_midi_dialog(&mut self) {
         let trace = self.begin_user_trace("file.open_dialog");
         let Some(path) = rfd::FileDialog::new()
-            .add_filter("Song files", &["mid", "midi", "fmid", "fplist"])
+            .add_filter("Song files", &Self::open_dialog_extensions())
             .pick_file()
         else {
             self.set_status("Open canceled");
@@ -1311,14 +2060,50 @@ impl FlutzDesktopApp {
     }
 
     pub fn open_project_path(&mut self, path: PathBuf) {
+        self.open_project_path_with_resume(path, false);
+    }
+
+    fn open_project_path_with_resume(&mut self, path: PathBuf, resume_after_load: bool) {
         let extension = path
             .extension()
             .and_then(|ext| ext.to_str())
             .map(|ext| ext.to_ascii_lowercase());
         match extension.as_deref() {
             Some("fplist") => self.load_fplist_path(path),
-            Some("fmid") => self.load_fmid_path(path),
-            _ => self.load_midi_path(path),
+            Some(ext) => {
+                let registry = builtin_registry();
+                match registry.find_by_extension(ext).copied() {
+                    Some(descriptor) if descriptor.content_kind == ContentKind::Fmid => {
+                        self.load_fmid_path(path);
+                        if resume_after_load && self.has_loaded_project() {
+                            self.play();
+                        }
+                    }
+                    Some(descriptor) if descriptor.content_kind == ContentKind::Midi => {
+                        self.load_midi_path(path);
+                        if resume_after_load && self.has_loaded_project() {
+                            self.play();
+                        }
+                    }
+                    Some(descriptor)
+                        if descriptor.mastering == MasteringCapability::DecodedAudioPeq =>
+                    {
+                        self.load_decoded_audio_path_with_resume(
+                            path,
+                            descriptor,
+                            resume_after_load,
+                            false,
+                        )
+                    }
+                    _ => self.set_status("Unsupported file type"),
+                }
+            }
+            None => {
+                self.load_midi_path(path);
+                if resume_after_load && self.has_loaded_project() {
+                    self.play();
+                }
+            }
         }
     }
 
@@ -1422,7 +2207,10 @@ impl FlutzDesktopApp {
         let next_index = preview.next_track_for_mode_by(|entry| {
             Self::is_supported_playlist_entry_path(&entry.file_path)
         })?;
-        preview.entries.get(next_index).map(|entry| entry.file_path.clone())
+        preview
+            .entries
+            .get(next_index)
+            .map(|entry| entry.file_path.clone())
     }
 
     pub fn next_track(&mut self) {
@@ -1488,14 +2276,16 @@ impl FlutzDesktopApp {
         }
         let path = playlist.entries[index].file_path.clone();
         playlist.set_current_with_history(index, push_history);
-        let loaded = self.load_playlist_entry_path(path);
+        let loaded = if let Some(preloaded) = self.take_ready_playlist_preload(index, &path) {
+            self.commit_decoded_audio_load(preloaded, autoplay, true)
+        } else {
+            self.clear_playlist_preload();
+            self.load_playlist_entry_path(path, autoplay)
+        };
         if loaded {
             // Playlist repeat mode is authoritative for track looping when a track
             // is selected from a playlist (.fplist load, next/prev, double-click).
             self.sync_loop_button_from_playlist_repeat_mode(false);
-        }
-        if loaded && autoplay {
-            self.play();
         }
         loaded
     }
@@ -1505,7 +2295,9 @@ impl FlutzDesktopApp {
             return false;
         };
         preview
-            .prev_track_for_mode_by(|entry| Self::is_supported_playlist_entry_path(&entry.file_path))
+            .prev_track_for_mode_by(|entry| {
+                Self::is_supported_playlist_entry_path(&entry.file_path)
+            })
             .is_some()
     }
 
@@ -1514,7 +2306,9 @@ impl FlutzDesktopApp {
             return false;
         };
         preview
-            .next_track_for_mode_by(|entry| Self::is_supported_playlist_entry_path(&entry.file_path))
+            .next_track_for_mode_by(|entry| {
+                Self::is_supported_playlist_entry_path(&entry.file_path)
+            })
             .is_some()
     }
 
@@ -1552,33 +2346,52 @@ impl FlutzDesktopApp {
             .current_path
             .as_deref()
             .map(PathBuf::from)
-            .filter(|path| {
-                path.extension()
-                    .and_then(|ext| ext.to_str())
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("fmid"))
-            });
+            .filter(|path| self.can_save_project_to_existing_path(path));
 
         if let Some(path) = path {
-            self.save_fmid_to_path(path);
+            self.save_project_to_path(path);
         } else {
             self.save_project_as();
         }
         self.finish_user_trace(trace, "file.save", "completed");
     }
 
-    fn load_playlist_entry_path(&mut self, path: PathBuf) -> bool {
+    fn load_playlist_entry_path(&mut self, path: PathBuf, autoplay: bool) -> bool {
         let extension = path
             .extension()
             .and_then(|ext| ext.to_str())
             .map(|ext| ext.to_ascii_lowercase());
 
         match extension.as_deref() {
-            Some("fmid") => {
-                self.load_fmid_path(path);
-                true
-            }
-            Some("mid") | Some("midi") => {
-                self.load_midi_path(path);
+            Some(ext) => {
+                let registry = builtin_registry();
+                let Some(descriptor) = registry.find_by_extension(ext).copied() else {
+                    self.set_status("Skipped unsupported file: unsupported playlist entry type");
+                    return false;
+                };
+                match descriptor.content_kind {
+                    ContentKind::Fmid => {
+                        self.load_fmid_path(path);
+                        if autoplay {
+                            self.play();
+                        }
+                    }
+                    ContentKind::Midi => {
+                        self.load_midi_path(path);
+                        if autoplay {
+                            self.play();
+                        }
+                    }
+                    _ if descriptor.mastering == MasteringCapability::DecodedAudioPeq => {
+                        self.load_decoded_audio_path_with_resume(path, descriptor, autoplay, true);
+                    }
+                    _ => {
+                        self.set_status(
+                            "Skipped unsupported file: unsupported playlist entry type",
+                        );
+                        return false;
+                    }
+                }
                 true
             }
             _ => {
@@ -1591,14 +2404,11 @@ impl FlutzDesktopApp {
     fn is_supported_playlist_entry_path(path: &Path) -> bool {
         path.extension()
             .and_then(|ext| ext.to_str())
-            .is_some_and(|ext| {
-                ext.eq_ignore_ascii_case("mid")
-                    || ext.eq_ignore_ascii_case("midi")
-                    || ext.eq_ignore_ascii_case("fmid")
-            })
+            .is_some_and(|ext| builtin_registry().find_by_extension(ext).is_some())
     }
 
     pub fn new_playlist(&mut self) {
+        self.clear_playlist_preload();
         let mut playlist = PlaylistState::default();
         playlist.shuffle_seed = 0xC0FFEE_u64;
         self.playlist = Some(playlist);
@@ -1609,6 +2419,7 @@ impl FlutzDesktopApp {
     }
 
     pub fn load_fplist_path(&mut self, path: PathBuf) {
+        self.clear_playlist_preload();
         match playlist_persistence::load_playlist(&path) {
             Ok(mut playlist) => {
                 if playlist.entries.is_empty() {
@@ -1687,6 +2498,7 @@ impl FlutzDesktopApp {
     }
 
     fn remove_selected_playlist_entries(&mut self) {
+        self.clear_playlist_preload();
         let Some(playlist) = self.playlist.as_mut() else {
             return;
         };
@@ -1694,7 +2506,11 @@ impl FlutzDesktopApp {
             return;
         }
 
-        let indices = self.playlist_selected_indices.iter().copied().collect::<Vec<_>>();
+        let indices = self
+            .playlist_selected_indices
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
         playlist.remove_indices(&indices);
         self.playlist_selected_indices.clear();
     }
@@ -1706,7 +2522,7 @@ impl FlutzDesktopApp {
         self.playlist_file_picker_pending = false;
 
         let Some(paths) = rfd::FileDialog::new()
-            .add_filter("Playlist Tracks", &["mid", "midi", "fmid"])
+            .add_filter("Playlist Tracks", &Self::playlist_dialog_extensions())
             .pick_files()
         else {
             return;
@@ -1715,6 +2531,7 @@ impl FlutzDesktopApp {
         if self.playlist.is_none() {
             self.new_playlist();
         }
+        self.clear_playlist_preload();
         if let Some(playlist) = self.playlist.as_mut() {
             playlist.add_entries(paths);
         }
@@ -1745,6 +2562,7 @@ impl FlutzDesktopApp {
         if self.playlist.is_none() {
             self.new_playlist();
         }
+        self.clear_playlist_preload();
         if let Some(playlist) = self.playlist.as_mut() {
             playlist.add_entries(filtered);
             self.set_playlist_window_open(true);
@@ -1766,6 +2584,124 @@ impl FlutzDesktopApp {
         self.last_playback_active = currently_active;
     }
 
+    fn process_pending_playlist_preload(&mut self) {
+        let Some(pending) = &self.pending_playlist_preload else {
+            return;
+        };
+        let token = pending.token;
+        let index = pending.index;
+        let path = pending.path.clone();
+        let result = match pending.receiver.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.pending_playlist_preload = None;
+                return;
+            }
+        };
+        self.pending_playlist_preload = None;
+        if token != PLAYLIST_PRELOAD_TOKEN.load(Ordering::Relaxed) || result.error.is_some() {
+            return;
+        }
+        self.ready_playlist_preload = Some(ReadyPlaylistPreload {
+            token,
+            index,
+            path,
+            result,
+        });
+    }
+
+    fn maybe_start_playlist_preload(&mut self) {
+        if self.run_state != AppRunState::Playing || !self.playback.playback_active() {
+            return;
+        }
+        if self.loop_enabled
+            || self
+                .playlist
+                .as_ref()
+                .is_some_and(|playlist| playlist.repeat_mode == PlaylistRepeatMode::Track)
+        {
+            self.clear_playlist_preload();
+            return;
+        }
+        let duration = self.transport_duration_seconds();
+        let position = self.transport_seconds();
+        if duration <= 0.0 || duration - position > PLAYLIST_PRELOAD_LEAD_TIME_SECONDS {
+            return;
+        }
+        let Some((index, path, descriptor)) = self.next_playlist_preload_candidate() else {
+            self.clear_playlist_preload();
+            return;
+        };
+        if self
+            .ready_playlist_preload
+            .as_ref()
+            .is_some_and(|preload| preload.index == index && preload.path == path)
+            || self
+                .pending_playlist_preload
+                .as_ref()
+                .is_some_and(|preload| preload.index == index && preload.path == path)
+        {
+            return;
+        }
+        if descriptor.mastering != MasteringCapability::DecodedAudioPeq {
+            self.clear_playlist_preload();
+            return;
+        }
+        let token = PLAYLIST_PRELOAD_TOKEN.fetch_add(1, Ordering::Relaxed) + 1;
+        let (sender, receiver) = mpsc::channel();
+        let path_for_worker = path.clone();
+        let spawn_result = thread::Builder::new()
+            .name("flutz-playlist-preload".to_owned())
+            .spawn(move || {
+                let result = prepare_decoded_audio_load_job(token, path_for_worker, descriptor);
+                let _ = sender.send(result);
+            });
+        if spawn_result.is_ok() {
+            self.pending_playlist_preload = Some(PendingPlaylistPreload {
+                token,
+                index,
+                path,
+                receiver,
+            });
+        }
+    }
+
+    fn next_playlist_preload_candidate(&self) -> Option<(usize, PathBuf, FormatDescriptor)> {
+        let mut preview = self.playlist.clone()?;
+        let index = preview.next_track_for_mode_by(|entry| {
+            Self::is_supported_playlist_entry_path(&entry.file_path)
+        })?;
+        let path = preview.entries.get(index)?.file_path.clone();
+        let extension = path.extension().and_then(|ext| ext.to_str())?;
+        let descriptor = builtin_registry().find_by_extension(extension).copied()?;
+        Some((index, path, descriptor))
+    }
+
+    fn clear_playlist_preload(&mut self) {
+        self.pending_playlist_preload = None;
+        self.ready_playlist_preload = None;
+        PLAYLIST_PRELOAD_TOKEN.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn take_ready_playlist_preload(
+        &mut self,
+        index: usize,
+        path: &Path,
+    ) -> Option<DecodedAudioLoadJobResult> {
+        let preload = self.ready_playlist_preload.take()?;
+        if preload.index == index
+            && preload.path == path
+            && preload.token == PLAYLIST_PRELOAD_TOKEN.load(Ordering::Relaxed)
+        {
+            self.pending_playlist_preload = None;
+            Some(preload.result)
+        } else {
+            self.ready_playlist_preload = Some(preload);
+            None
+        }
+    }
+
     pub fn on_track_end(&mut self) -> bool {
         let repeat_track = self
             .playlist
@@ -1780,20 +2716,18 @@ impl FlutzDesktopApp {
             return true;
         }
 
-        let wrap = self
-            .playlist
-            .as_ref()
-            .is_some_and(|playlist| playlist.loop_enabled || playlist.repeat_mode == PlaylistRepeatMode::Playlist);
+        let wrap = self.playlist.as_ref().is_some_and(|playlist| {
+            playlist.loop_enabled || playlist.repeat_mode == PlaylistRepeatMode::Playlist
+        });
         if !wrap {
             return false;
         }
 
-        let first_index = self
-            .playlist
-            .as_mut()
-            .and_then(|playlist| {
-                playlist.first_valid_track_by(|entry| Self::is_supported_playlist_entry_path(&entry.file_path))
-            });
+        let first_index = self.playlist.as_mut().and_then(|playlist| {
+            playlist.first_valid_track_by(|entry| {
+                Self::is_supported_playlist_entry_path(&entry.file_path)
+            })
+        });
         if let Some(index) = first_index {
             return self.load_playlist_track_by_index(index, false, true);
         }
@@ -1803,9 +2737,9 @@ impl FlutzDesktopApp {
 
     pub fn save_project_as(&mut self) {
         let trace = self.begin_user_trace("file.save_as");
-        let default_name = default_fmid_file_name(&self.project_title);
+        let (filter_name, extensions, default_name) = self.save_as_dialog_spec();
         let Some(path) = rfd::FileDialog::new()
-            .add_filter("FMID files", &["fmid"])
+            .add_filter(&filter_name, &extensions)
             .set_file_name(&default_name)
             .save_file()
         else {
@@ -1813,7 +2747,7 @@ impl FlutzDesktopApp {
             self.finish_user_trace(trace, "file.save_as", "canceled");
             return;
         };
-        self.save_fmid_to_path(path);
+        self.save_project_to_path(path);
         self.finish_user_trace(trace, "file.save_as", "completed");
     }
 
@@ -1837,16 +2771,28 @@ impl FlutzDesktopApp {
                     .and_then(|name| name.to_str())
                     .map(str::to_owned)
                     .unwrap_or_else(|| "Loaded MIDI".to_owned());
+                self.loaded_content = Some(LoadedContentState {
+                    kind: ContentKind::Midi,
+                    format_id: "midi".to_owned(),
+                    friendly_name: "MIDI sequence".to_owned(),
+                    mastering: MasteringCapability::MidiMastering,
+                    wrapped_extension: Some("fmid".to_owned()),
+                    decoded_wrapper: None,
+                    decoded_source_path: None,
+                    decoded_source_bytes: None,
+                });
                 self.current_path = Some(path.display().to_string());
                 self.transport_position = 0.0;
                 self.run_state = AppRunState::Idle;
                 self.active_preset_id = preset.id.to_owned();
                 self.selected_preset_id = preset.id.to_owned();
-                self.soundfonts = soundfont_rows_from_catalog(&self.catalog_soundfonts, preset.font_ids);
+                self.soundfonts =
+                    soundfont_rows_from_catalog(&self.catalog_soundfonts, preset.font_ids);
                 self.apply_metadata_for_plain_midi(&path);
                 self.reset_plain_midi_defaults();
                 let transport_metadata = self.playback.midi_transport_metadata();
-                let has_non_default_loop = Self::midi_has_non_default_loop_config(&transport_metadata);
+                let has_non_default_loop =
+                    Self::midi_has_non_default_loop_config(&transport_metadata);
                 self.apply_midi_transport_metadata(transport_metadata);
                 self.apply_loop_defaults_after_load(has_non_default_loop);
                 self.sync_coverage_cache_from_playback();
@@ -1854,6 +2800,7 @@ impl FlutzDesktopApp {
                 self.sync_playback_controls();
                 self.sync_playback_loop_settings();
                 self.log_midi_mapping_scan_result("file.load_midi");
+                self.peq_edit_state = PeqEditState::default();
                 self.set_status(message);
                 self.finish_user_trace(trace, "file.load_midi", "ok");
             }
@@ -1934,6 +2881,16 @@ impl FlutzDesktopApp {
                 } else {
                     fmid.project.project_name.clone()
                 };
+                self.loaded_content = Some(LoadedContentState {
+                    kind: ContentKind::Fmid,
+                    format_id: "fmid".to_owned(),
+                    friendly_name: "Flutz MIDI project".to_owned(),
+                    mastering: MasteringCapability::MidiMastering,
+                    wrapped_extension: Some("fmid".to_owned()),
+                    decoded_wrapper: None,
+                    decoded_source_path: None,
+                    decoded_source_bytes: None,
+                });
                 self.current_path = Some(path.display().to_string());
                 self.transport_position = 0.0;
                 self.run_state = AppRunState::Idle;
@@ -1960,6 +2917,7 @@ impl FlutzDesktopApp {
 
                 self.dirty = false;
                 self.log_midi_mapping_scan_result("file.load_fmid");
+                self.peq_edit_state = PeqEditState::default();
                 self.set_status(
                     preset_mode_message.unwrap_or_else(|| format!("Loaded FMID: {message}")),
                 );
@@ -1968,6 +2926,157 @@ impl FlutzDesktopApp {
             Err(error) => {
                 self.set_status(format!("{error}"));
                 self.finish_user_trace(trace, "file.load_fmid", "error");
+            }
+        }
+    }
+
+    pub fn load_decoded_audio_path(&mut self, path: PathBuf, descriptor: FormatDescriptor) {
+        self.load_decoded_audio_path_with_resume(path, descriptor, false, false);
+    }
+
+    fn load_decoded_audio_path_with_resume(
+        &mut self,
+        path: PathBuf,
+        descriptor: FormatDescriptor,
+        resume_after_load: bool,
+        playlist_entry_load: bool,
+    ) {
+        let trace = self.begin_user_trace("file.load_decoded_audio");
+        let token = DECODED_AUDIO_LOAD_TOKEN.fetch_add(1, Ordering::Relaxed) + 1;
+        let (sender, receiver) = mpsc::channel();
+        self.pending_decoded_audio_load = Some(PendingDecodedAudioLoad {
+            token,
+            receiver,
+            resume_after_load,
+            playlist_entry_load,
+        });
+        let path_for_status = path.display().to_string();
+        let spawn_result = thread::Builder::new()
+            .name("flutz-decoded-load".to_owned())
+            .spawn(move || {
+                let result = prepare_decoded_audio_load_job(token, path, descriptor);
+                let _ = sender.send(result);
+            });
+        if let Err(error) = spawn_result {
+            self.pending_decoded_audio_load = None;
+            self.set_status(format!("failed to start decoded audio load: {error}"));
+            self.finish_user_trace(trace, "file.load_decoded_audio", "spawn_error");
+            return;
+        }
+        self.set_status(format!("Loading decoded audio {}", path_for_status));
+        self.finish_user_trace(trace, "file.load_decoded_audio", "scheduled");
+    }
+
+    fn process_pending_decoded_audio_load(&mut self) {
+        let Some(pending) = &self.pending_decoded_audio_load else {
+            return;
+        };
+        let token = pending.token;
+        let resume_after_load = pending.resume_after_load;
+        let playlist_entry_load = pending.playlist_entry_load;
+        let result = match pending.receiver.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.pending_decoded_audio_load = None;
+                self.set_status("decoded audio load worker exited before reporting a result");
+                return;
+            }
+        };
+        self.pending_decoded_audio_load = None;
+        if result.token != token || result.token != DECODED_AUDIO_LOAD_TOKEN.load(Ordering::Relaxed)
+        {
+            return;
+        }
+        let _ = self.commit_decoded_audio_load(result, resume_after_load, playlist_entry_load);
+    }
+
+    fn commit_decoded_audio_load(
+        &mut self,
+        result: DecodedAudioLoadJobResult,
+        resume_after_load: bool,
+        playlist_entry_load: bool,
+    ) -> bool {
+        let DecodedAudioLoadJobResult {
+            path,
+            path_display,
+            descriptor,
+            is_wrapped,
+            wrapper,
+            stream_source,
+            source_bytes,
+            error,
+            error_stage,
+            ..
+        } = result;
+        if let Some(error) = error {
+            self.set_status(format!("decoded audio {error_stage} failed: {error}"));
+            return false;
+        }
+        let Some(wrapper) = wrapper else {
+            self.set_status("decoded audio load did not produce wrapper metadata");
+            return false;
+        };
+        let Some(stream_source) = stream_source else {
+            self.set_status("decoded audio load did not produce a stream source");
+            return false;
+        };
+
+        match self.playback.load_decoded_audio_stream(
+            path.clone(),
+            descriptor.id,
+            descriptor.friendly_name,
+            stream_source,
+            wrapper.peq.clone(),
+        ) {
+            Ok(message) => {
+                self.loaded_content = Some(LoadedContentState {
+                    kind: if is_wrapped {
+                        ContentKind::DecodedAudioWrapper
+                    } else {
+                        ContentKind::DecodedAudio
+                    },
+                    format_id: descriptor.id.to_owned(),
+                    friendly_name: descriptor.friendly_name.to_owned(),
+                    mastering: descriptor.mastering,
+                    wrapped_extension: descriptor
+                        .wrapped_extensions
+                        .first()
+                        .map(|extension| (*extension).to_owned()),
+                    decoded_wrapper: Some(wrapper.clone()),
+                    decoded_source_path: (!is_wrapped).then(|| path.clone()),
+                    decoded_source_bytes: source_bytes,
+                });
+                self.project_title = if wrapper.metadata.project_name.trim().is_empty() {
+                    path.file_stem()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("Loaded Audio")
+                        .to_owned()
+                } else {
+                    wrapper.metadata.project_name.clone()
+                };
+                self.current_path = Some(path_display);
+                self.transport_position = 0.0;
+                self.run_state = AppRunState::Idle;
+                self.apply_metadata_for_decoded_audio(&wrapper, &path);
+                self.apply_decoded_audio_defaults(wrapper.loop_region);
+                self.reset_decoded_peq_edit_state(wrapper.peq.clone());
+                self.sync_playback_loop_settings();
+                if playlist_entry_load {
+                    self.sync_loop_button_from_playlist_repeat_mode(false);
+                }
+                self.reset_strip_layout();
+                self.sync_playback_controls();
+                self.dirty = !is_wrapped;
+                self.set_status(message);
+                if resume_after_load {
+                    self.play();
+                }
+                true
+            }
+            Err(error) => {
+                self.set_status(format!("{error}"));
+                false
             }
         }
     }
@@ -2077,7 +3186,10 @@ impl FlutzDesktopApp {
     }
 
     pub fn transport_tick_length(&self) -> u64 {
-        self.playback.midi_transport_metadata().tick_length
+        self.playback
+            .decoded_transport_metadata()
+            .map(|metadata| metadata.frame_length)
+            .unwrap_or_else(|| self.playback.midi_transport_metadata().tick_length)
     }
 
     pub fn debug_metrics(&self) -> PlaybackDebugMetrics {
@@ -2470,6 +3582,141 @@ impl FlutzDesktopApp {
         self.mark_dirty();
     }
 
+    pub fn apply_decoded_peq_config(&mut self, config: PeqConfig) {
+        let source = self.peq_edit_state.source;
+        let preset_path = self.peq_edit_state.preset_path.clone();
+        self.apply_decoded_peq_config_with_source(config, source, preset_path, true);
+    }
+
+    pub fn reset_decoded_peq_config(&mut self) {
+        self.apply_decoded_peq_config_with_source(
+            self.default_decoded_peq_preset.config.clone(),
+            PeqConfigSource::Default,
+            None,
+            false,
+        );
+    }
+
+    pub fn apply_builtin_decoded_peq_preset(&mut self, preset_name: &str) {
+        if self.active_mastering_capability() != MasteringCapability::DecodedAudioPeq {
+            self.set_status("Load decoded audio before selecting a PEQ preset");
+            return;
+        }
+        let preset = load_builtin_decoded_peq_preset(preset_name);
+        self.apply_decoded_peq_config_with_source(
+            preset.config,
+            PeqConfigSource::BuiltInPreset,
+            None,
+            true,
+        );
+        self.peq_edit_state.preset.metadata = preset.metadata;
+        self.peq_edit_state.preset.extra_fields = preset.extra_fields;
+        self.set_status(format!("Applied built-in PEQ preset {preset_name}"));
+    }
+
+    pub fn save_decoded_peq_default(&mut self) {
+        let mut preset = self.peq_edit_state.preset.clone();
+        preset.config = self.peq_edit_state.preset.config.clone();
+        self.default_decoded_peq_preset = normalize_default_decoded_peq_preset(preset);
+        self.persist_window_view_prefs();
+        if self.peq_edit_state.source == PeqConfigSource::Default {
+            self.peq_edit_state.dirty = false;
+        }
+        self.set_status("Saved decoded audio PEQ default to preferences.ini");
+    }
+
+    pub fn set_decoded_peq_bypass_enabled(&mut self, enabled: bool) {
+        if self.decoded_peq_bypass_enabled == enabled {
+            return;
+        }
+        self.decoded_peq_bypass_enabled = enabled;
+        self.persist_window_view_prefs();
+        if self.active_mastering_capability() == MasteringCapability::DecodedAudioPeq {
+            let config = self.peq_edit_state.preset.config.clone();
+            if let Err(error) = self.apply_decoded_peq_runtime_config(&config) {
+                self.set_status(format!("{error}"));
+                return;
+            }
+        }
+        self.set_status(if enabled {
+            "Bypass EQ enabled"
+        } else {
+            "Bypass EQ disabled"
+        });
+    }
+
+    pub fn load_decoded_peq_preset_dialog(&mut self) {
+        if self.active_mastering_capability() != MasteringCapability::DecodedAudioPeq {
+            self.set_status("Load decoded audio before loading a PEQ preset");
+            return;
+        }
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("PEQ preset", &["fpeq", "toml"])
+            .pick_file()
+        else {
+            self.set_status("Load PEQ canceled");
+            return;
+        };
+        match load_preset_file(&path) {
+            Ok(preset) => {
+                self.apply_decoded_peq_config_with_source(
+                    preset.config,
+                    PeqConfigSource::PresetFile,
+                    Some(path.clone()),
+                    false,
+                );
+                self.peq_edit_state.preset.metadata = preset.metadata;
+                self.peq_edit_state.preset.extra_fields = preset.extra_fields;
+                self.peq_edit_state.dirty = false;
+                self.set_status(format!("Loaded PEQ preset {}", path.display()));
+            }
+            Err(error) => self.set_status(format!("{error}")),
+        }
+    }
+
+    pub fn save_decoded_peq_preset(&mut self) {
+        if let Some(path) = self.peq_edit_state.preset_path.clone() {
+            self.save_decoded_peq_preset_to_path(path);
+        } else {
+            self.save_decoded_peq_preset_as();
+        }
+    }
+
+    pub fn save_decoded_peq_preset_as(&mut self) {
+        if self.active_mastering_capability() != MasteringCapability::DecodedAudioPeq {
+            self.set_status("Load decoded audio before saving a PEQ preset");
+            return;
+        }
+        let default_name = format!("{}.fpeq", sanitize_file_stem(self.project_title()));
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("PEQ preset", &["fpeq", "toml"])
+            .set_file_name(default_name)
+            .save_file()
+        else {
+            self.set_status("Save PEQ canceled");
+            return;
+        };
+        self.save_decoded_peq_preset_to_path(path);
+    }
+
+    fn save_decoded_peq_preset_to_path(&mut self, path: PathBuf) {
+        let mut preset = self.peq_edit_state.preset.clone();
+        if preset.metadata.name.is_none() {
+            preset.metadata.name = Some(self.project_title().to_owned());
+        }
+        match save_preset_file(&path, &preset) {
+            Ok(()) => {
+                self.peq_edit_state.preset = preset;
+                self.peq_edit_state.preset_path = Some(path.clone());
+                if self.peq_edit_state.source == PeqConfigSource::PresetFile {
+                    self.peq_edit_state.dirty = false;
+                }
+                self.set_status(format!("Saved PEQ preset {}", path.display()));
+            }
+            Err(error) => self.set_status(format!("{error}")),
+        }
+    }
+
     fn save_fmid_to_path(&mut self, path: PathBuf) {
         match self.build_fmid_file() {
             Ok(fmid_file) => {
@@ -2482,6 +3729,9 @@ impl FlutzDesktopApp {
                         }
                         self.dirty = false;
                         self.metadata_edit_dirty = false;
+                        self.peq_edit_state.source = PeqConfigSource::Wrapper;
+                        self.peq_edit_state.preset_path = None;
+                        self.peq_edit_state.dirty = false;
                         self.set_status(format!("Saved {}", path.display()));
                     }
                     Err(error) => {
@@ -2493,6 +3743,165 @@ impl FlutzDesktopApp {
         }
     }
 
+    fn save_project_to_path(&mut self, path: PathBuf) {
+        if self
+            .loaded_content
+            .as_ref()
+            .is_some_and(|content| content.mastering == MasteringCapability::DecodedAudioPeq)
+        {
+            if let Err(error) = self.validate_decoded_wrapper_save_path(&path) {
+                self.set_status(format!("{error}"));
+                return;
+            }
+            self.save_decoded_wrapper_to_path(path);
+        } else {
+            self.save_fmid_to_path(path);
+        }
+    }
+
+    fn validate_decoded_wrapper_save_path(&self, path: &Path) -> Result<()> {
+        let Some(content) = self
+            .loaded_content
+            .as_ref()
+            .filter(|content| content.mastering == MasteringCapability::DecodedAudioPeq)
+        else {
+            return Ok(());
+        };
+
+        let wrapped_extension = content
+            .wrapped_extension
+            .as_deref()
+            .unwrap_or("faudio")
+            .trim_start_matches('.');
+        let Some(extension) = path.extension().and_then(|ext| ext.to_str()) else {
+            return Err(FlutzError::InvalidInput(format!(
+                "decoded audio projects must be saved as .{wrapped_extension} wrapper files"
+            )));
+        };
+        if !wrapped_extension.eq_ignore_ascii_case(extension) {
+            return Err(FlutzError::InvalidInput(format!(
+                "decoded audio projects must be saved as .{wrapped_extension} wrapper files"
+            )));
+        }
+
+        if content
+            .decoded_source_path
+            .as_deref()
+            .is_some_and(|source_path| paths_refer_to_same_file(path, source_path))
+        {
+            return Err(FlutzError::InvalidInput(format!(
+                "cannot overwrite the active decoded source {}; save to a different .{wrapped_extension} wrapper path",
+                path.display()
+            )));
+        }
+
+        Ok(())
+    }
+
+    fn can_save_project_to_existing_path(&self, path: &Path) -> bool {
+        let Some(extension) = path.extension().and_then(|ext| ext.to_str()) else {
+            return false;
+        };
+        if extension.eq_ignore_ascii_case("fmid") {
+            return true;
+        }
+        self.loaded_content.as_ref().is_some_and(|content| {
+            content.mastering == MasteringCapability::DecodedAudioPeq
+                && content
+                    .wrapped_extension
+                    .as_deref()
+                    .is_some_and(|wrapped| wrapped.eq_ignore_ascii_case(extension))
+        })
+    }
+
+    fn save_decoded_wrapper_to_path(&mut self, path: PathBuf) {
+        match self.build_decoded_wrapper_file() {
+            Ok(wrapper) => match write_flutz_wrapper(&wrapper) {
+                Ok(bytes) => match std::fs::write(&path, bytes) {
+                    Ok(()) => {
+                        if let Some(content) = &mut self.loaded_content {
+                            let decoded_source_path = content.decoded_source_path.clone();
+                            let decoded_source_bytes = content.decoded_source_bytes.clone();
+                            content.kind = ContentKind::DecodedAudioWrapper;
+                            content.decoded_wrapper = Some(wrapper);
+                            content.decoded_source_path = decoded_source_path;
+                            content.decoded_source_bytes = decoded_source_bytes;
+                        }
+                        self.current_path = Some(path.display().to_string());
+                        if !self.metadata_edit_state.project_name.trim().is_empty() {
+                            self.project_title = self.metadata_edit_state.project_name.clone();
+                        }
+                        self.dirty = false;
+                        self.metadata_edit_dirty = false;
+                        self.set_status(format!("Saved {}", path.display()));
+                    }
+                    Err(error) => {
+                        self.set_status(format!("failed to write {}: {error}", path.display()))
+                    }
+                },
+                Err(error) => self.set_status(format!("{error}")),
+            },
+            Err(error) => self.set_status(format!("{error}")),
+        }
+    }
+
+    fn build_decoded_wrapper_file(&self) -> Result<FlutzAudioWrapper> {
+        let source_path = self
+            .loaded_content
+            .as_ref()
+            .and_then(|content| content.decoded_source_path.clone());
+        let source_bytes = self
+            .loaded_content
+            .as_ref()
+            .and_then(|content| content.decoded_source_bytes.clone());
+        let mut wrapper = self
+            .loaded_content
+            .as_ref()
+            .and_then(|content| content.decoded_wrapper.clone())
+            .ok_or_else(|| {
+                FlutzError::InvalidInput("load decoded audio before saving".to_owned())
+            })?;
+        if wrapper.source.bytes.is_empty() {
+            if let Some(source_bytes) = source_bytes {
+                wrapper.source.bytes = source_bytes.to_vec();
+            } else {
+                let source_path = source_path.ok_or_else(|| {
+                    FlutzError::InvalidInput(
+                        "decoded source bytes are unavailable for wrapper save".to_owned(),
+                    )
+                })?;
+                wrapper.source.bytes = fs::read(&source_path).map_err(|error| {
+                    FlutzError::Runtime(format!(
+                        "failed to read decoded source {} for wrapper save: {error}",
+                        source_path.display()
+                    ))
+                })?;
+            }
+        }
+        wrapper.metadata = TrackMetadata {
+            ..self.metadata_edit_state.to_track_metadata(
+                self.project_title(),
+                &wrapper.source.original_filename,
+            )
+        };
+        wrapper.native_metadata = normalized_metadata_fields(&self.metadata_edit_state.native_metadata);
+        wrapper.loop_region = Some(MediaLoop {
+            enabled: self.loop_enabled,
+            mode: match self.loop_mode {
+                LoopMode::None => MediaLoopMode::None,
+                LoopMode::Infinite => MediaLoopMode::Infinite,
+                LoopMode::Counted => MediaLoopMode::Counted,
+            },
+            unit: LoopUnit::SampleFrames {
+                start: self.loop_start_tick,
+                end: self.loop_end_tick,
+            },
+            loop_count: self.loop_count.max(1) as u64,
+        });
+        wrapper.peq = Some(self.peq_edit_state.preset.clone());
+        Ok(wrapper)
+    }
+
     fn build_fmid_file(&self) -> Result<FmidFile> {
         let midi_bytes = self
             .playback
@@ -2500,26 +3909,14 @@ impl FlutzDesktopApp {
             .ok_or_else(|| FlutzError::InvalidInput("load a MIDI file before saving".to_owned()))?
             .to_vec();
 
-        let project = FmidProjectRecord {
-            project_name: if self.metadata_edit_state.project_name.trim().is_empty() {
-                self.project_title().to_owned()
-            } else {
-                self.metadata_edit_state.project_name.clone()
-            },
-            source_midi_filename: if self.metadata_edit_state.source_midi_filename.trim().is_empty() {
-                self
-                    .playback
-                    .loaded_midi()
-                    .and_then(|path| path.file_name())
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("embedded.mid")
-                    .to_owned()
-            } else {
-                self.metadata_edit_state.source_midi_filename.clone()
-            },
-            project_flags: 0,
-            notes: self.metadata_edit_state.notes.clone(),
-        };
+        let project = self.metadata_edit_state.to_fmid_project(
+            self.project_title(),
+            self.playback
+                .loaded_midi()
+                .and_then(|path| path.file_name())
+                .and_then(|name| name.to_str())
+                .unwrap_or("embedded.mid"),
+        );
 
         let loaded_soundfonts = self.playback.loaded_soundfont_ids();
         let soundfont_ids = if loaded_soundfonts.is_empty() {
@@ -3236,32 +4633,162 @@ impl FlutzDesktopApp {
             .to_owned();
         self.metadata_edit_state = MetadataEditState {
             project_name: project_name.clone(),
-            source_midi_filename: source_name,
-            notes: String::new(),
+            source_filename: source_name,
+            ..MetadataEditState::default()
         };
         self.project_title = project_name;
         self.metadata_edit_dirty = false;
     }
 
     fn apply_metadata_for_fmid(&mut self, fmid: &FmidFile, path: &Path) {
-        self.metadata_edit_state = MetadataEditState {
-            project_name: if fmid.project.project_name.trim().is_empty() {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("Loaded FMID")
-                    .to_owned()
-            } else {
-                fmid.project.project_name.clone()
-            },
-            source_midi_filename: if fmid.project.source_midi_filename.trim().is_empty() {
-                "embedded.mid".to_owned()
-            } else {
-                fmid.project.source_midi_filename.clone()
-            },
-            notes: fmid.project.notes.clone(),
-        };
+        self.metadata_edit_state = MetadataEditState::from_fmid_project(
+            &fmid.project,
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("Loaded FMID")
+                .to_owned(),
+            "embedded.mid".to_owned(),
+        );
         self.project_title = self.metadata_edit_state.project_name.clone();
         self.metadata_edit_dirty = false;
+    }
+
+    fn apply_metadata_for_decoded_audio(&mut self, wrapper: &FlutzAudioWrapper, path: &Path) {
+        let project_name = if wrapper.metadata.project_name.trim().is_empty() {
+            path.file_stem()
+                .and_then(|name| name.to_str())
+                .unwrap_or("Loaded Audio")
+                .to_owned()
+        } else {
+            wrapper.metadata.project_name.clone()
+        };
+        let source_filename = if wrapper.metadata.source_filename.trim().is_empty() {
+            wrapper.source.original_filename.clone()
+        } else {
+            wrapper.metadata.source_filename.clone()
+        };
+        self.metadata_edit_state = MetadataEditState::from_track_metadata(
+            &wrapper.metadata,
+            project_name.clone(),
+            source_filename,
+        )
+        .with_native_metadata(wrapper.native_metadata.clone());
+        self.project_title = project_name;
+        self.metadata_edit_dirty = false;
+    }
+
+    fn apply_decoded_audio_defaults(&mut self, loop_region: Option<MediaLoop>) {
+        self.soundfonts.clear();
+        self.coverage_cache.clear();
+        self.selected_soundfont = 0;
+        self.mixer_assignment_mode = MixerAssignmentMode::Manual;
+        self.master = MasterControls::default();
+        self.smart_mix = SmartMixControls::default();
+        self.final_output_volume_percent = 0.0;
+
+        if let Some(loop_region) = loop_region {
+            self.loop_enabled = loop_region.enabled;
+            self.loop_mode = match loop_region.mode {
+                MediaLoopMode::None => LoopMode::None,
+                MediaLoopMode::Infinite => LoopMode::Infinite,
+                MediaLoopMode::Counted => LoopMode::Counted,
+            };
+            if let LoopUnit::SampleFrames { start, end } = loop_region.unit {
+                self.loop_start_tick = start;
+                self.loop_end_tick = end;
+            } else {
+                self.loop_start_tick = 0;
+                self.loop_end_tick = self.transport_tick_length();
+            }
+            self.loop_count = loop_region.loop_count.max(1).min(u32::MAX as u64) as u32;
+            self.normalize_loop_state(false);
+            return;
+        }
+
+        let frame_length = self.transport_tick_length();
+        let enable_by_default = self.should_enable_loop_by_default(false);
+        self.loop_mode = if enable_by_default {
+            LoopMode::Infinite
+        } else {
+            LoopMode::None
+        };
+        self.loop_enabled = enable_by_default && frame_length > 0;
+        self.loop_start_tick = 0;
+        self.loop_end_tick = if self.loop_enabled { frame_length } else { 0 };
+        self.loop_count = 1;
+        self.normalize_loop_state(false);
+    }
+
+    fn reset_decoded_peq_edit_state(&mut self, peq: Option<PeqPresetFile>) {
+        let sample_rate = self
+            .playback
+            .decoded_transport_metadata()
+            .map(|metadata| metadata.sample_rate)
+            .unwrap_or(48_000);
+        let (preset, source) = match peq {
+            Some(mut preset) => {
+                preset = normalize_runtime_decoded_peq_preset(preset, sample_rate, 2);
+                (preset, PeqConfigSource::Wrapper)
+            }
+            None => {
+                let preset = normalize_runtime_decoded_peq_preset(
+                    self.default_decoded_peq_preset.clone(),
+                    sample_rate,
+                    2,
+                );
+                (preset, PeqConfigSource::Default)
+            }
+        };
+        self.peq_edit_state = PeqEditState {
+            preset: preset.clone(),
+            source,
+            preset_path: None,
+            dirty: false,
+        };
+        if let Err(error) = self.apply_decoded_peq_runtime_config(&preset.config) {
+            self.set_status(format!("{error}"));
+        }
+    }
+
+    fn apply_decoded_peq_runtime_config(&mut self, config: &PeqConfig) -> Result<()> {
+        let runtime_config = effective_decoded_peq_config(config.clone(), self.decoded_peq_bypass_enabled);
+        self.playback.set_decoded_peq_config(runtime_config).map(|_| ())
+    }
+
+    fn apply_decoded_peq_config_with_source(
+        &mut self,
+        config: PeqConfig,
+        source: PeqConfigSource,
+        preset_path: Option<PathBuf>,
+        mark_dirty: bool,
+    ) {
+        if self.active_mastering_capability() != MasteringCapability::DecodedAudioPeq {
+            self.set_status("Load decoded audio before editing PEQ");
+            return;
+        }
+        let sample_rate = self
+            .playback
+            .decoded_transport_metadata()
+            .map(|metadata| metadata.sample_rate)
+            .unwrap_or(config.sample_rate_hz);
+        let config = normalized_decoded_peq_config(config, sample_rate, 2);
+        if let Err(error) = self.apply_decoded_peq_runtime_config(&config) {
+            self.set_status(format!("{error}"));
+            return;
+        }
+        let changed = self.peq_edit_state.preset.config != config;
+        self.peq_edit_state.preset.config = config;
+        self.peq_edit_state.source = source;
+        self.peq_edit_state.preset_path = preset_path;
+        self.peq_edit_state.dirty = mark_dirty && changed;
+        if let Some(content) = &mut self.loaded_content {
+            if let Some(wrapper) = &mut content.decoded_wrapper {
+                wrapper.peq = Some(self.peq_edit_state.preset.clone());
+            }
+        }
+        if changed && mark_dirty {
+            self.mark_dirty();
+        }
     }
 
     fn midi_has_non_default_loop_config(metadata: &MidiTransportMetadata) -> bool {
@@ -3401,6 +4928,61 @@ impl FlutzDesktopApp {
         }
         let metrics = self.debug_metrics();
         self.perf_trace.record_user_event(label, outcome, &metrics);
+    }
+
+    fn open_dialog_extensions() -> Vec<String> {
+        let mut extensions = Self::playlist_dialog_extensions();
+        extensions.push("fplist".to_owned());
+        extensions.sort();
+        extensions.dedup();
+        extensions
+    }
+
+    fn playlist_dialog_extensions() -> Vec<String> {
+        let mut extensions = Vec::new();
+        for descriptor in builtin_registry().descriptors() {
+            extensions.extend(
+                descriptor
+                    .extensions
+                    .iter()
+                    .map(|extension| (*extension).to_owned()),
+            );
+            extensions.extend(
+                descriptor
+                    .wrapped_extensions
+                    .iter()
+                    .map(|extension| (*extension).to_owned()),
+            );
+        }
+        extensions.sort();
+        extensions.dedup();
+        extensions
+    }
+
+    fn save_as_dialog_spec(&self) -> (String, Vec<String>, String) {
+        if let Some(content) = self
+            .loaded_content
+            .as_ref()
+            .filter(|content| content.mastering == MasteringCapability::DecodedAudioPeq)
+        {
+            let extension = content
+                .wrapped_extension
+                .as_deref()
+                .unwrap_or("faudio")
+                .trim_start_matches('.');
+            let default_name = default_wrapped_audio_file_name(&self.project_title, extension);
+            return (
+                format!("Flutz {} wrapper", content.friendly_name),
+                vec![extension.to_owned()],
+                default_name,
+            );
+        }
+
+        (
+            "FMID files".to_owned(),
+            vec!["fmid".to_owned()],
+            default_fmid_file_name(&self.project_title),
+        )
     }
 
     fn record_diagnostic_trace(&mut self, label: &str, outcome: &str, details: &[(&str, String)]) {
@@ -3723,4 +5305,175 @@ fn default_fmid_file_name(project_title: &str) -> String {
         .filter(|value| !value.trim().is_empty())
         .unwrap_or(trimmed_title);
     format!("{}.fmid", stem.trim_end_matches('.'))
+}
+
+fn default_wrapped_audio_file_name(project_title: &str, extension: &str) -> String {
+    let trimmed_title = project_title.trim();
+    let stem = Path::new(trimmed_title)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(trimmed_title);
+    format!("{}.{}", stem.trim_end_matches('.'), extension)
+}
+
+fn sanitize_file_stem(project_title: &str) -> String {
+    let trimmed_title = project_title.trim();
+    let stem = Path::new(trimmed_title)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(trimmed_title)
+        .trim_end_matches('.');
+    if stem.is_empty() {
+        "peq-preset".to_owned()
+    } else {
+        stem.to_owned()
+    }
+}
+
+fn paths_refer_to_same_file(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+
+    match (fs::canonicalize(left), fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => {
+            let left = left.as_os_str().to_string_lossy();
+            let right = right.as_os_str().to_string_lossy();
+            #[cfg(windows)]
+            {
+                left.eq_ignore_ascii_case(&right)
+            }
+            #[cfg(not(windows))]
+            {
+                left == right
+            }
+        }
+    }
+}
+
+fn builtin_decoded_peq_preset_names() -> &'static [&'static str] {
+    &["Default", "Flat"]
+}
+
+fn builtin_decoded_peq_preset_text(name: &str) -> Option<&'static str> {
+    match name {
+        "Default" => Some(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../assets/eq-presets/Default.fpeq"
+        ))),
+        "Flat" => Some(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../assets/eq-presets/Flat.fpeq"
+        ))),
+        _ => None,
+    }
+}
+
+fn load_builtin_decoded_peq_preset(name: &str) -> PeqPresetFile {
+    let text = builtin_decoded_peq_preset_text(name)
+        .unwrap_or_else(|| panic!("missing built-in decoded PEQ preset {name}"));
+    let mut preset = deserialize_preset_toml(text)
+        .unwrap_or_else(|error| panic!("failed to parse built-in decoded PEQ preset {name}: {error}"));
+    preset.metadata.name = Some(name.to_owned());
+    preset.metadata.tags.clear();
+    preset
+}
+
+fn default_decoded_peq_preset(sample_rate_hz: u32, channel_count: u16) -> PeqPresetFile {
+    PeqPresetFile {
+        metadata: PresetMetadata {
+            name: Some("Current Track Wrapper Settings".to_owned()),
+            ..PresetMetadata::default()
+        },
+        config: default_decoded_peq_config(sample_rate_hz, channel_count),
+        extra_fields: BTreeMap::new(),
+    }
+}
+
+fn normalize_runtime_decoded_peq_preset(
+    mut preset: PeqPresetFile,
+    sample_rate_hz: u32,
+    channel_count: u16,
+) -> PeqPresetFile {
+    preset.metadata.tags.clear();
+    preset.config = normalized_decoded_peq_config(preset.config, sample_rate_hz, channel_count);
+    preset
+}
+
+fn normalize_default_decoded_peq_preset(mut preset: PeqPresetFile) -> PeqPresetFile {
+    preset.metadata.name = Some("Default".to_owned());
+    preset.metadata.tags.clear();
+    preset
+}
+
+fn effective_decoded_peq_config(mut config: PeqConfig, bypass_enabled: bool) -> PeqConfig {
+    if bypass_enabled {
+        config.wet_mix = 0.0;
+    }
+    config
+}
+
+fn default_decoded_peq_config(sample_rate_hz: u32, channel_count: u16) -> PeqConfig {
+    PeqConfig {
+        sample_rate_hz: sample_rate_hz.max(1),
+        channel_count: channel_count.max(1),
+        channel_layout: ChannelLayout::Interleaved,
+        output_gain_db: 0.0,
+        wet_mix: 1.0,
+        bands: vec![PeqBandConfig {
+            enabled: false,
+            frequency_hz: 1_000.0,
+            gain_db: 0.0,
+            bandwidth: Bandwidth::Q { value: 0.8 },
+            attack_ms: 10.0,
+            release_ms: 80.0,
+            ..PeqBandConfig::default()
+        }],
+        extra_fields: BTreeMap::new(),
+    }
+}
+
+fn normalized_decoded_peq_config(
+    mut config: PeqConfig,
+    sample_rate_hz: u32,
+    channel_count: u16,
+) -> PeqConfig {
+    config.sample_rate_hz = sample_rate_hz.max(1);
+    config.channel_count = channel_count.max(1);
+    config.channel_layout = ChannelLayout::Interleaved;
+    config.output_gain_db = config.output_gain_db.clamp(-24.0, 24.0);
+    config.wet_mix = config.wet_mix.clamp(0.0, 1.0);
+    let nyquist = config.sample_rate_hz as f32 * 0.5;
+    for band in &mut config.bands {
+        band.frequency_hz = band.frequency_hz.clamp(20.0, (nyquist - 1.0).max(20.0));
+        band.gain_db = band.gain_db.clamp(-24.0, 24.0);
+        band.attack_ms = band.attack_ms.max(0.0);
+        band.release_ms = band.release_ms.max(0.0);
+        match &mut band.bandwidth {
+            Bandwidth::Q { value } | Bandwidth::Octaves { value } => {
+                *value = value.clamp(0.05, 12.0);
+            }
+        }
+    }
+    config.bands.sort_by(|left, right| {
+        peq_band_sort_frequency(left)
+            .partial_cmp(&peq_band_sort_frequency(right))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    config
+}
+
+fn peq_band_sort_frequency(band: &PeqBandConfig) -> f32 {
+    let width = match band.bandwidth {
+        Bandwidth::Q { value } => value.max(0.05),
+        Bandwidth::Octaves { value } => value.max(0.05),
+    };
+    match band.filter_type {
+        flutz_peq::PeqFilterType::LowShelf => 0.0,
+        flutz_peq::PeqFilterType::HighShelf => band.frequency_hz,
+        flutz_peq::PeqFilterType::Bell => (band.frequency_hz / width.sqrt()).max(0.0),
+    }
 }

@@ -99,7 +99,7 @@ try {
 
 
     Write-Host "Building flutzplayer binary"
-    $appBuildArgs = @("build", "-p", "flutz_app", "--features", "jemalloc-memory") + $cargoModeArgs
+    $appBuildArgs = @("build", "-p", "flutzplayer", "--features", "jemalloc-memory") + $cargoModeArgs
     Invoke-Cargo -CargoExe $CargoExe -Args $appBuildArgs
 
     Write-Host "Building DAT packer binary"

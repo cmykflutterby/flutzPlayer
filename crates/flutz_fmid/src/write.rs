@@ -112,8 +112,32 @@ fn write_project(project: &ProjectRecord) -> Vec<u8> {
     let mut out = Vec::new();
     write_utf8_into(&mut out, &project.project_name);
     write_utf8_into(&mut out, &project.source_midi_filename);
+    write_utf8_into(&mut out, &project.artist);
+    write_utf8_into(&mut out, &project.album);
+    write_utf8_into(&mut out, &project.album_artist);
+    write_utf8_into(&mut out, &project.composer);
+    write_utf8_into(&mut out, &project.conductor);
+    write_utf8_into(&mut out, &project.genre);
+    write_utf8_into(&mut out, &project.date);
+    write_utf8_into(&mut out, &project.track_number);
+    write_utf8_into(&mut out, &project.track_total);
+    write_utf8_into(&mut out, &project.disc_number);
+    write_utf8_into(&mut out, &project.disc_total);
+    write_utf8_into(&mut out, &project.description);
+    write_utf8_into(&mut out, &project.copyright);
+    write_utf8_into(&mut out, &project.publisher);
+    write_utf8_into(&mut out, &project.encoded_by);
+    write_utf8_into(&mut out, &project.encoder);
+    write_utf8_into(&mut out, &project.language);
+    write_utf8_into(&mut out, &project.lyrics);
+    write_utf8_into(&mut out, &project.url);
     write_u64(&mut out, project.project_flags);
     write_utf8_into(&mut out, &project.notes);
+    write_u64(&mut out, project.extra_fields.len() as u64);
+    for (key, value) in &project.extra_fields {
+        write_utf8_into(&mut out, key);
+        write_utf8_into(&mut out, value);
+    }
     out
 }
 

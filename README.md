@@ -5,7 +5,7 @@
 flutzPlayer is a desktop music player and mastering tool for audiophiles who want more features and better fidelity from their audio formats. flutzPlayer accomplishes this by adding a complex mixer and mastering stage to the rendering pipeline which users can tune to their specific needs. These mastered versions can be saved in a flutz wrapper format so that settings persist across playback.
 
 For example, MIDI files can be mastered and saved as FMidi files, combining:
-- Per-track, configurable layered SoundFonts
+- Per-track, configurable layered SoundFonts (multiple, simultaneous fonts, blended, your way)
 - Fine-grain control of loop points and styles
 - Master Mixer control for gain, effects and EQ
 - Per-font, Per-instrument control of gain, effects, panning and EQ
@@ -15,15 +15,18 @@ For example, MIDI files can be mastered and saved as FMidi files, combining:
 
 This allows enriched playback of MIDI files to produce the best sound to match the composer intent; 8-bit tracks sound like 8-bit hardware, symphonic tracks sound non-synthetic, and composers can ensure you hear their tracks on the retro hardware they designed it for - all without having to change rendering settings between tracks.
 
+![flutzPlayer GUI with Mixer and Master](docs/flutzPlayer-screen-3.png)
+
+Encoded Audio format support! Remaster your audio files by saving in a flutz format, enabling track-level Parametric EQ/Mastering or simply set default equalizer settings to best fit your speakers or preferences.
+
 **Quick Notes:**
  - This should compile and work on all OS, but has only been tested in Windows
- - Memory and CPU loads have only basic Optimization; Runs very well for me (YMMV)
- - More formats are planned in the future and will release over time
- - If you want a feature, make a feature branch and give me a PR
+ - Memory and CPU loads have only basic Optimization; Runs very well for me using only 67MB of memory (YMMV)
  - UI is intentionally simple, CTRL+/CTRL- are your friend
+ - Project needs a better UI
  - this project's main goal is to exercise the sound engine of the flutzBox emulator 
- - all requirements are to be compiled-in
  - this build-init script will configure build artifacts so builds work and assumes MSYS/GNU Toolchain
+ - i'm not an audio engineer
 
 ## Download, Install, and Use
 
@@ -39,16 +42,11 @@ This allows enriched playback of MIDI files to produce the best sound to match t
 | Standard MIDI | .mid, .midi | Supported | Primary source input format. |
 | flutz MIDI wrapper | .fmid | Supported | Embedded MIDI + persisted mix/render/project data. |
 | flutz playlist | .fplist | Supported | Playlist/session container (not an audio codec). |
-
-## Planned media expansion
-
-| Planned media | Planned flutz wrapper example | Status |
-| --- | --- | --- |
-| MP3 | .fmp3 | Planned |
-| FLAC | .fflac | Planned |
-| Ogg Vorbis / Opus | .fogg / .fopus | Planned |
-| WAV / AIFF | .fwav / .faiff | Planned |
-| AAC in MP4/M4A | .fm4a / .fmp4 | Planned |
+| MP3 | .fmp3 | Supported | |
+| FLAC | .fflac | Supported | |
+| Ogg Vorbis / Opus | .fogg / .fopus | Supported | |
+| WAV / AIFF | .fwav / .faiff | Supported | |
+| AAC in MP4/M4A | .fm4a / .fmp4 | Supported | |
 
 ## Developer Build Guide
 
@@ -100,14 +98,14 @@ To return the checkout to a pre-initialized state, run:
 ## First build/validation flow
 
 ```powershell
-cargo check -p flutz_app
+cargo check -p flutzplayer
 .\build.ps1 -Configuration Debug -BuildDat
 ```
 
 Run from source:
 
 ```powershell
-cargo run -p flutz_app -- --gui --data-dir drops/flutzplayer/data
+cargo run -p flutzplayer -- --gui --data-dir drops/flutzplayer/data
 ```
 
 Run packaged drop:
@@ -171,18 +169,25 @@ DAT files are loaded together to allow an easy and quick method for granular loa
 
 | Crate | Purpose | Notes |
 | --- | --- | --- |
-| flutz_app | Desktop app composition/UI | |
-| flutz_audio_sdl3 | SDL3 audio backend wrapper | default audio output, no flag needed |
-| flutz_audio_wasapi | WASAPI backend wrapper | handles ring buffer for better WASAPI output, use flag to use |
-| flutz_core | Shared domain/core types | |
-| flutz_dat | DAT archive read/write and pack logic | Multi-threaded instrument loading |
-| flutz_fmid | FMID format implementation | |
-| flutz_mixer | Mixer DSP/control primitives | |
-| flutz_soundfont_tools | SoundFont tooling/conversion utilities | sf2/sf2Ark conversions and analysis |
-| flutz_synth | MIDI/synth runtime orchestration | |
-| flutz_visualizer_core | Visualizer DSP core | configurable audio visualizer |
-| flutz_visualizer_egui | egui visualizer adapter | egui visualizer renderer |
-| rustystem | RustySynth-derived renderer fork | Created for granular 'stem' level rendering |
+| flutz_app | Desktop app composition/UI | Main app shell, release/debug UI, metadata editor, and playback orchestration |
+| flutz_audio_sdl3 | SDL3 audio backend wrapper | Default audio output; no flag needed |
+| flutz_audio_wasapi | WASAPI backend wrapper | Windows output path with ring-buffered playback; enable with the WASAPI flag |
+| flutz_core | Shared domain/core types | Common error, preset, and workspace-wide data types |
+| flutz_dat | DAT archive read/write and pack logic | Multi-threaded instrument loading and DAT packaging |
+| flutz_fmid | FMID format implementation | MIDI wrapper/project container persistence |
+| flutz_formats | Common playable format registry and wrapper records | Symphonia-backed decode, metadata, and wrapper handling |
+| flutz_format_aac | AAC/MP4 backend registration | Symphonia decode probe support for AAC/MP4 |
+| flutz_format_flac | FLAC backend registration | Symphonia decode probe support for FLAC |
+| flutz_format_mp3 | MP3 backend registration | Symphonia decode probe support for MP3 |
+| flutz_format_ogg | Ogg Vorbis/Opus backend registration | Symphonia decode probe support for Ogg Vorbis and Opus |
+| flutz_format_pcm | WAV/AIFF PCM backend registration | Symphonia decode probe support for PCM containers |
+| flutz_mixer | Mixer DSP/control primitives | Shared mixer, EQ, limiter, and routing primitives |
+| flutz_peq | Streaming parametric EQ primitives | Decoded-audio mastering presets and runtime PEQ |
+| flutz_soundfont_tools | SoundFont tooling/conversion utilities | sf2/sf2Ark conversions, analysis, and SoundFont pipeline helpers |
+| flutz_synth | MIDI/synth runtime orchestration | Playback runtime, note scheduling, and routing |
+| flutz_visualizer_core | Visualizer DSP core | Configurable spectrum and analyzer frame generation |
+| flutz_visualizer_egui | egui visualizer adapter | egui renderer for visualizer frames |
+| rustystem | RustySynth-derived renderer fork | Granular stem-level rendering and synth backend support |
 
 ## Inspirations
 
