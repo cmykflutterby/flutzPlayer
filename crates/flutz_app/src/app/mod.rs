@@ -399,6 +399,287 @@ fn normalized_metadata_fields(fields: &[MetadataField]) -> Vec<MetadataField> {
         .collect()
 }
 
+pub fn merge_imported_track_metadata(
+    mut lower_priority: TrackMetadata,
+    higher_priority: TrackMetadata,
+) -> TrackMetadata {
+    overlay_non_empty(&mut lower_priority.project_name, higher_priority.project_name);
+    overlay_non_empty(&mut lower_priority.source_filename, higher_priority.source_filename);
+    overlay_non_empty(&mut lower_priority.artist, higher_priority.artist);
+    overlay_non_empty(&mut lower_priority.album, higher_priority.album);
+    overlay_non_empty(&mut lower_priority.album_artist, higher_priority.album_artist);
+    overlay_non_empty(&mut lower_priority.composer, higher_priority.composer);
+    overlay_non_empty(&mut lower_priority.conductor, higher_priority.conductor);
+    overlay_non_empty(&mut lower_priority.genre, higher_priority.genre);
+    overlay_non_empty(&mut lower_priority.date, higher_priority.date);
+    overlay_non_empty(&mut lower_priority.track_number, higher_priority.track_number);
+    overlay_non_empty(&mut lower_priority.track_total, higher_priority.track_total);
+    overlay_non_empty(&mut lower_priority.disc_number, higher_priority.disc_number);
+    overlay_non_empty(&mut lower_priority.disc_total, higher_priority.disc_total);
+    overlay_non_empty(&mut lower_priority.description, higher_priority.description);
+    overlay_non_empty(&mut lower_priority.copyright, higher_priority.copyright);
+    overlay_non_empty(&mut lower_priority.publisher, higher_priority.publisher);
+    overlay_non_empty(&mut lower_priority.encoded_by, higher_priority.encoded_by);
+    overlay_non_empty(&mut lower_priority.encoder, higher_priority.encoder);
+    overlay_non_empty(&mut lower_priority.language, higher_priority.language);
+    overlay_non_empty(&mut lower_priority.lyrics, higher_priority.lyrics);
+    overlay_non_empty(&mut lower_priority.url, higher_priority.url);
+    overlay_non_empty(&mut lower_priority.notes, higher_priority.notes);
+    lower_priority.extra_fields = merge_metadata_field_lists(
+        lower_priority.extra_fields,
+        higher_priority.extra_fields,
+    );
+    lower_priority
+}
+
+fn overlay_non_empty(slot: &mut String, value: String) {
+    if !value.trim().is_empty() {
+        *slot = value;
+    }
+}
+
+pub fn merge_metadata_field_lists(
+    lower_priority: Vec<MetadataField>,
+    higher_priority: Vec<MetadataField>,
+) -> Vec<MetadataField> {
+    let mut merged = Vec::new();
+    let mut seen = BTreeSet::<String>::new();
+    for field in higher_priority.into_iter().chain(lower_priority) {
+        let key = field.key.trim();
+        let value = field.value.trim();
+        if key.is_empty() && value.is_empty() {
+            continue;
+        }
+        let normalized_key = metadata_field_key(key);
+        if seen.insert(normalized_key) {
+            merged.push(MetadataField {
+                key: key.to_owned(),
+                value: value.to_owned(),
+            });
+        }
+    }
+    merged
+}
+
+fn metadata_field_key(key: &str) -> String {
+    key.trim()
+        .to_ascii_lowercase()
+        .replace([' ', '-', '/', '.'], "_")
+}
+
+fn apply_imported_metadata_field(
+    metadata: &mut TrackMetadata,
+    extras: &mut Vec<MetadataField>,
+    key: &str,
+    value: String,
+) {
+    let value = value.trim();
+    if value.is_empty() {
+        return;
+    }
+    match metadata_field_key(key).as_str() {
+        "system_title" | "title" | "tracktitle" | "track_title" => {
+            metadata.project_name = value.to_owned()
+        }
+        "system_music_artist" | "artist" => metadata.artist = value.to_owned(),
+        "system_music_albumtitle" | "system_music_album" | "album" => {
+            metadata.album = value.to_owned()
+        }
+        "system_music_albumartist" | "albumartist" | "album_artist" => {
+            metadata.album_artist = value.to_owned()
+        }
+        "system_music_composer" | "composer" => metadata.composer = value.to_owned(),
+        "system_music_conductor" | "conductor" => metadata.conductor = value.to_owned(),
+        "system_music_genre" | "genre" => metadata.genre = value.to_owned(),
+        "system_media_datereleased" | "system_itemdate" | "date" | "year" => {
+            metadata.date = value.to_owned()
+        }
+        "system_music_tracknumber" | "tracknumber" | "track_number" => {
+            metadata.track_number = value.to_owned()
+        }
+        "system_music_trackcount" | "tracktotal" | "track_total" | "totaltracks" => {
+            metadata.track_total = value.to_owned()
+        }
+        "system_music_partofset" | "discnumber" | "disc_number" => {
+            metadata.disc_number = value.to_owned()
+        }
+        "system_comment" | "comment" | "comments" => metadata.notes = value.to_owned(),
+        "system_copyright" | "copyright" => metadata.copyright = value.to_owned(),
+        "system_company" | "system_music_publisher" | "publisher" | "label" => {
+            metadata.publisher = value.to_owned()
+        }
+        "system_encodedby" | "encodedby" | "encoded_by" => {
+            metadata.encoded_by = value.to_owned()
+        }
+        "system_media_encodingtool" | "encoder" => metadata.encoder = value.to_owned(),
+        "system_language" | "language" => metadata.language = value.to_owned(),
+        "system_music_lyrics" | "lyrics" => metadata.lyrics = value.to_owned(),
+        "system_link_targeturl" | "url" | "website" => metadata.url = value.to_owned(),
+        _ => extras.push(MetadataField {
+            key: key.to_owned(),
+            value: value.to_owned(),
+        }),
+    }
+}
+
+pub fn track_metadata_from_imported_fields(fields: &[MetadataField]) -> TrackMetadata {
+    let mut metadata = TrackMetadata::default();
+    let mut extras = Vec::new();
+    for field in fields {
+        apply_imported_metadata_field(
+            &mut metadata,
+            &mut extras,
+            field.key.as_str(),
+            field.value.clone(),
+        );
+    }
+    metadata.extra_fields = merge_metadata_field_lists(Vec::new(), extras);
+    metadata
+}
+
+pub fn decoded_project_title(
+    metadata: &TrackMetadata,
+    native_metadata: &[MetadataField],
+    fallback_project_name: &str,
+) -> String {
+    if !metadata.project_name.trim().is_empty() {
+        return metadata.project_name.clone();
+    }
+    let imported = track_metadata_from_imported_fields(native_metadata);
+    if !imported.project_name.trim().is_empty() {
+        return imported.project_name;
+    }
+    fallback_project_name.to_owned()
+}
+
+fn read_os_track_metadata(path: &Path) -> (TrackMetadata, Vec<MetadataField>) {
+    read_platform_os_track_metadata(path).unwrap_or_default()
+}
+
+#[cfg(not(windows))]
+fn read_platform_os_track_metadata(_path: &Path) -> Option<(TrackMetadata, Vec<MetadataField>)> {
+    None
+}
+
+#[cfg(windows)]
+fn read_platform_os_track_metadata(path: &Path) -> Option<(TrackMetadata, Vec<MetadataField>)> {
+    use windows::{
+        core::HSTRING,
+        Win32::{
+            Foundation::RPC_E_CHANGED_MODE,
+            System::{
+                Com::{CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_APARTMENTTHREADED},
+                Com::StructuredStorage::{PropVariantClear, PropVariantToStringAlloc},
+            },
+            UI::Shell::PropertiesSystem::{
+                IPropertyStore, PSGetPropertyKeyFromName, SHGetPropertyStoreFromParsingName,
+                GPS_BESTEFFORT,
+            },
+        },
+    };
+
+    struct ComApartment {
+        uninitialize: bool,
+    }
+    impl Drop for ComApartment {
+        fn drop(&mut self) {
+            if self.uninitialize {
+                unsafe { CoUninitialize() };
+            }
+        }
+    }
+
+    let init = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+    let apartment = if init.is_ok() {
+        ComApartment { uninitialize: true }
+    } else if init == RPC_E_CHANGED_MODE {
+        ComApartment { uninitialize: false }
+    } else {
+        return None;
+    };
+
+    let path_string = path.as_os_str().to_string_lossy();
+    let path_hstring = HSTRING::from(path_string.as_ref());
+    let store = unsafe {
+        SHGetPropertyStoreFromParsingName::<
+            _,
+            Option<&windows::Win32::System::Com::IBindCtx>,
+            IPropertyStore,
+        >(&path_hstring, None, GPS_BESTEFFORT)
+    }
+    .ok()?;
+
+    let mut metadata = TrackMetadata::default();
+    let mut extras = Vec::new();
+    for property_name in OS_METADATA_PROPERTY_NAMES {
+        let name = HSTRING::from(*property_name);
+        let mut key = Default::default();
+        if unsafe { PSGetPropertyKeyFromName(&name, &mut key) }.is_err() {
+            continue;
+        }
+        let mut value = match unsafe { store.GetValue(&key) } {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let text = unsafe { PropVariantToStringAlloc(&value) }
+            .ok()
+            .and_then(|wide| {
+                let output = pwstr_to_string(wide);
+                unsafe { CoTaskMemFree(Some(wide.0.cast())) };
+                output
+            });
+        let _ = unsafe { PropVariantClear(&mut value) };
+        if let Some(text) = text {
+            apply_imported_metadata_field(&mut metadata, &mut extras, property_name, text);
+        }
+    }
+    drop(apartment);
+    Some((metadata, extras))
+}
+
+#[cfg(windows)]
+fn pwstr_to_string(value: windows::core::PWSTR) -> Option<String> {
+    if value.is_null() {
+        return None;
+    }
+    let mut len = 0usize;
+    unsafe {
+        while *value.0.add(len) != 0 {
+            len += 1;
+        }
+        let text = String::from_utf16_lossy(std::slice::from_raw_parts(value.0, len));
+        if text.trim().is_empty() {
+            None
+        } else {
+            Some(text)
+        }
+    }
+}
+
+const OS_METADATA_PROPERTY_NAMES: &[&str] = &[
+    "System.Title",
+    "System.Music.Artist",
+    "System.Music.AlbumTitle",
+    "System.Music.AlbumArtist",
+    "System.Music.Composer",
+    "System.Music.Conductor",
+    "System.Music.Genre",
+    "System.Media.DateReleased",
+    "System.ItemDate",
+    "System.Music.TrackNumber",
+    "System.Music.TrackCount",
+    "System.Music.PartOfSet",
+    "System.Comment",
+    "System.Copyright",
+    "System.Company",
+    "System.Music.Publisher",
+    "System.EncodedBy",
+    "System.Media.EncodingTool",
+    "System.Language",
+    "System.Music.Lyrics",
+    "System.Link.TargetUrl",
+];
+
 fn draw_metadata_text_field(ui: &mut egui::Ui, label: &str, value: &mut String) -> bool {
     ui.label(label);
     ui.text_edit_singleline(value).changed()
@@ -563,7 +844,8 @@ fn prepare_decoded_audio_load_job(
         .and_then(|name| name.to_str())
         .unwrap_or(&source_filename)
         .to_owned();
-    let (metadata, native_metadata) = read_track_metadata_with_symphonia(
+    let (os_metadata, os_extra_fields) = read_os_track_metadata(&path);
+    let (mut metadata, native_metadata) = read_track_metadata_with_symphonia(
         DecodedAudioStreamSource::Path(path.clone()),
         descriptor.id,
         &fallback_project_name,
@@ -572,13 +854,20 @@ fn prepare_decoded_audio_load_job(
     .unwrap_or_else(|_| {
         (
             TrackMetadata {
-                project_name: fallback_project_name.clone(),
                 source_filename: source_filename.clone(),
                 ..TrackMetadata::default()
             },
             Vec::new(),
         )
     });
+    metadata.extra_fields = merge_metadata_field_lists(os_extra_fields, metadata.extra_fields);
+    metadata = merge_imported_track_metadata(os_metadata, metadata);
+    if metadata.project_name.trim().is_empty() {
+        metadata.project_name = fallback_project_name;
+    }
+    if metadata.source_filename.trim().is_empty() {
+        metadata.source_filename = source_filename.clone();
+    }
     result.wrapper = Some(FlutzAudioWrapper {
         source: SourceAudioBlock {
             format_id: descriptor.id.to_owned(),
@@ -3047,19 +3336,19 @@ impl FlutzDesktopApp {
                     decoded_source_path: (!is_wrapped).then(|| path.clone()),
                     decoded_source_bytes: source_bytes,
                 });
-                self.project_title = if wrapper.metadata.project_name.trim().is_empty() {
+                self.project_title = decoded_project_title(
+                    &wrapper.metadata,
+                    &wrapper.native_metadata,
                     path.file_stem()
                         .and_then(|name| name.to_str())
-                        .unwrap_or("Loaded Audio")
-                        .to_owned()
-                } else {
-                    wrapper.metadata.project_name.clone()
-                };
+                        .unwrap_or("Loaded Audio"),
+                );
                 self.current_path = Some(path_display);
                 self.transport_position = 0.0;
                 self.run_state = AppRunState::Idle;
                 self.apply_metadata_for_decoded_audio(&wrapper, &path);
                 self.apply_decoded_audio_defaults(wrapper.loop_region);
+                self.sync_playback_output_volume();
                 self.reset_decoded_peq_edit_state(wrapper.peq.clone());
                 self.sync_playback_loop_settings();
                 if playlist_entry_load {
@@ -3615,11 +3904,11 @@ impl FlutzDesktopApp {
     }
 
     pub fn save_decoded_peq_default(&mut self) {
-        let mut preset = self.peq_edit_state.preset.clone();
-        preset.config = self.peq_edit_state.preset.config.clone();
-        self.default_decoded_peq_preset = normalize_default_decoded_peq_preset(preset);
+        let preset = saved_decoded_peq_default_from_current(&self.peq_edit_state.preset);
+        self.default_decoded_peq_preset = preset.clone();
         self.persist_window_view_prefs();
         if self.peq_edit_state.source == PeqConfigSource::Default {
+            self.peq_edit_state.preset = preset;
             self.peq_edit_state.dirty = false;
         }
         self.set_status("Saved decoded audio PEQ default to preferences.ini");
@@ -4654,14 +4943,13 @@ impl FlutzDesktopApp {
     }
 
     fn apply_metadata_for_decoded_audio(&mut self, wrapper: &FlutzAudioWrapper, path: &Path) {
-        let project_name = if wrapper.metadata.project_name.trim().is_empty() {
+        let project_name = decoded_project_title(
+            &wrapper.metadata,
+            &wrapper.native_metadata,
             path.file_stem()
                 .and_then(|name| name.to_str())
-                .unwrap_or("Loaded Audio")
-                .to_owned()
-        } else {
-            wrapper.metadata.project_name.clone()
-        };
+                .unwrap_or("Loaded Audio"),
+        );
         let source_filename = if wrapper.metadata.source_filename.trim().is_empty() {
             wrapper.source.original_filename.clone()
         } else {
@@ -4684,7 +4972,6 @@ impl FlutzDesktopApp {
         self.mixer_assignment_mode = MixerAssignmentMode::Manual;
         self.master = MasterControls::default();
         self.smart_mix = SmartMixControls::default();
-        self.final_output_volume_percent = 0.0;
 
         if let Some(loop_region) = loop_region {
             self.loop_enabled = loop_region.enabled;
@@ -4848,7 +5135,6 @@ impl FlutzDesktopApp {
     fn reset_plain_midi_defaults(&mut self) {
         self.dirty = false;
         self.mixer_assignment_mode = MixerAssignmentMode::Manual;
-        self.final_output_volume_percent = 0.0;
         self.loop_enabled = false;
         self.loop_mode = LoopMode::None;
         self.loop_start_tick = 0;
@@ -5407,6 +5693,18 @@ fn normalize_default_decoded_peq_preset(mut preset: PeqPresetFile) -> PeqPresetF
     preset.metadata.name = Some("Default".to_owned());
     preset.metadata.tags.clear();
     preset
+}
+
+pub fn saved_decoded_peq_default_from_current(preset: &PeqPresetFile) -> PeqPresetFile {
+    normalize_default_decoded_peq_preset(preset.clone())
+}
+
+pub fn runtime_decoded_peq_default_for_load(
+    preset: PeqPresetFile,
+    sample_rate_hz: u32,
+    channel_count: u16,
+) -> PeqPresetFile {
+    normalize_runtime_decoded_peq_preset(preset, sample_rate_hz, channel_count)
 }
 
 fn effective_decoded_peq_config(mut config: PeqConfig, bypass_enabled: bool) -> PeqConfig {

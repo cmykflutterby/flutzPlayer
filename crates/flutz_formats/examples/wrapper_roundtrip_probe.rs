@@ -28,6 +28,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             project_name: String::from("Wrapper Probe"),
             source_filename: String::from("mp3-44100-stereo.mp3"),
             notes: String::from("Decoded audio wrapper roundtrip probe."),
+            ..TrackMetadata::default()
         },
         loop_region: Some(MediaLoop {
             enabled: true,

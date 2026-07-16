@@ -392,7 +392,7 @@ pub fn decode_bytes_samples_with_symphonia(
 pub fn read_track_metadata_with_symphonia(
     source: DecodedAudioStreamSource,
     format_id: &str,
-    project_name_fallback: &str,
+    _project_name_fallback: &str,
     source_filename: &str,
 ) -> Result<(TrackMetadata, NativeMetadata)> {
     let (media_source, hint, _source_byte_len, _seekable) = stream_media_source(source)?;
@@ -414,7 +414,6 @@ pub fn read_track_metadata_with_symphonia(
     Ok(extract_track_and_native_metadata(
         tags,
         format_id,
-        project_name_fallback,
         source_filename,
     ))
 }
@@ -528,11 +527,9 @@ fn decode_media_source_samples(
 fn extract_track_and_native_metadata(
     tags: &[Tag],
     format_id: &str,
-    project_name_fallback: &str,
     source_filename: &str,
 ) -> (TrackMetadata, NativeMetadata) {
     let mut metadata = TrackMetadata {
-        project_name: project_name_fallback.to_owned(),
         source_filename: source_filename.to_owned(),
         ..TrackMetadata::default()
     };
@@ -561,13 +558,7 @@ fn extract_track_and_native_metadata(
         });
     }
 
-    if metadata.project_name.trim().is_empty() {
-        metadata.project_name = if project_name_fallback.trim().is_empty() {
-            format!("Loaded {format_id}")
-        } else {
-            project_name_fallback.to_owned()
-        };
-    }
+    let _ = format_id;
     if metadata.source_filename.trim().is_empty() {
         metadata.source_filename = source_filename.to_owned();
     }

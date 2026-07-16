@@ -135,6 +135,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or("source.audio")
                 .to_owned(),
             notes: "Decoded wrapper PEQ persistence probe.".to_owned(),
+            ..TrackMetadata::default()
         },
         peq: Some(reloaded.clone()),
         ..FlutzAudioWrapper::default()

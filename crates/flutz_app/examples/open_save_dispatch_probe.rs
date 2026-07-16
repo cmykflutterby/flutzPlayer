@@ -57,6 +57,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or("source.mp3")
                 .to_owned(),
             notes: "Native decoded audio save-as wrapper probe.".to_owned(),
+            ..TrackMetadata::default()
         },
         ..FlutzAudioWrapper::default()
     };
