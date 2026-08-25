@@ -38,8 +38,14 @@ pub fn run() -> Result<()> {
 
     let args = env::args().skip(1).collect::<Vec<_>>();
     let launched_from_terminal = launched_from_terminal();
+    let launch_mode = LaunchMode::parse(&args, launched_from_terminal)?;
 
-    match LaunchMode::parse(&args, launched_from_terminal)? {
+    #[cfg(windows)]
+    if matches!(&launch_mode, LaunchMode::Gui(_)) {
+        let _ = flutz_media_controls::register_media_control_jump_list_tasks();
+    }
+
+    match launch_mode {
         LaunchMode::Gui(config) => app::run_gui(config),
         LaunchMode::Tool(command) => run_tool(command),
     }
@@ -178,6 +184,7 @@ enum LaunchMode {
 enum ToolCommand {
     Help(PathBuf),
     DebugEnvironment(PathBuf),
+    MediaCommand(flutz_media_controls::MediaControlCommand),
     Verify(PathBuf),
     InspectDat(PathBuf),
     CheckPlayback {
@@ -253,6 +260,13 @@ impl LaunchMode {
                 reject_startup_path(startup_path.as_deref(), "--debug-env")?;
                 Ok(Self::Tool(ToolCommand::DebugEnvironment(data_dir)))
             }
+            ParsedCommand::MediaCommand(command) => {
+                reject_startup_path(
+                    startup_path.as_deref(),
+                    flutz_media_controls::MEDIA_COMMAND_ARGUMENT_NAME,
+                )?;
+                Ok(Self::Tool(ToolCommand::MediaCommand(command)))
+            }
             ParsedCommand::Verify(path) => {
                 reject_startup_path(startup_path.as_deref(), "--verify")?;
                 Ok(Self::Tool(ToolCommand::Verify(path)))
@@ -293,6 +307,7 @@ enum ParsedCommand {
     Headless,
     Help,
     DebugEnvironment,
+    MediaCommand(flutz_media_controls::MediaControlCommand),
     Verify(PathBuf),
     InspectDat(Option<PathBuf>),
     CheckPlayback(PathBuf),
@@ -324,6 +339,22 @@ impl ParsedArgs {
                 "--debug-latency" => parsed.debug_latency = true,
                 "--debug-analyzer" => parsed.debug_analyzer = true,
                 "--debug-render-errors" => parsed.debug_render_errors = true,
+                flutz_media_controls::MEDIA_COMMAND_ARGUMENT_NAME => {
+                    index += 1;
+                    let value = args.get(index).ok_or_else(|| {
+                        FlutzError::InvalidInput(format!(
+                            "{} requires play, pause, play-pause, stop, next, or previous",
+                            flutz_media_controls::MEDIA_COMMAND_ARGUMENT_NAME
+                        ))
+                    })?;
+                    let command = flutz_media_controls::media_command_from_argument(value)
+                        .ok_or_else(|| {
+                            FlutzError::InvalidInput(format!(
+                                "unknown media command: {value}; expected play, pause, play-pause, stop, next, or previous"
+                            ))
+                        })?;
+                    parsed.set_command(ParsedCommand::MediaCommand(command))?;
+                }
                 "--gui" => parsed.set_command(ParsedCommand::Gui)?,
                 "--headless" => parsed.set_command(ParsedCommand::Headless)?,
                 "--help" | "-h" => parsed.set_command(ParsedCommand::Help)?,
@@ -405,6 +436,10 @@ fn run_tool(command: ToolCommand) -> Result<()> {
             Ok(())
         }
         ToolCommand::DebugEnvironment(data_dir) => print_debug_environment(&data_dir),
+        ToolCommand::MediaCommand(command) => {
+            let _ = flutz_media_controls::send_media_command_to_running_instance(command);
+            Ok(())
+        }
         ToolCommand::Verify(path) => verify_file(&path),
         ToolCommand::InspectDat(path) => inspect_dat_fileset(&path),
         ToolCommand::CheckPlayback {
@@ -420,7 +455,7 @@ fn tool_help(default_data_dir: &Path) -> String {
     let playback_inputs = playback_check_input_summary();
     let verify_inputs = verify_input_summary();
     format!(
-        "flutzplayer\n\nGUI launch:\n  flutzplayer --gui [{open_inputs}] [--data-dir <dat-directory>] [--audio-backend sdl3|wasapi] [--debug-memory] [--debug-latency] [--debug-analyzer] [--debug-render-errors]\n  flutzplayer [{open_inputs}]\n\nHeadless/console launch:\n  flutzplayer --headless [--data-dir <dat-directory>]\n\nConsole diagnostics:\n  flutzplayer --verify <{verify_inputs}>\n  flutzplayer --inspect-dat [file.dat|dat-directory]\n  flutzplayer --check-playback <{playback_inputs}> [--data-dir <dat-directory>] [--debug-render-errors]\n  flutzplayer --debug-env\n  flutzplayer --help\n\nData files default to a data folder beside the executable:\n  {}\n\nUse --data-dir to point the player at a different DAT data folder. Use --audio-backend or FLUTZ_AUDIO_BACKEND to choose sdl3 or wasapi. Use --debug-memory to enable jemalloc/domain memory snapshots and session log output in debug builds. Use --debug-latency to write sparse latency JSONL in debug builds. Use --debug-analyzer to write spectrum analyzer JSONL under _local/analyzer-trace. Use --debug-render-errors to capture panic-safe render failure traces and MIDI SysEx interpretation detail under _local/render-error-trace in debug-friendly runs. Launch defaults: Explorer/no-terminal starts GUI; terminal/no-args prints this diagnostic surface; a bare project path opens the GUI directly; --headless always prints this diagnostic surface.",
+        "flutzplayer\n\nGUI launch:\n  flutzplayer --gui [{open_inputs}] [--data-dir <dat-directory>] [--audio-backend sdl3|wasapi] [--debug-memory] [--debug-latency] [--debug-analyzer] [--debug-render-errors]\n  flutzplayer [{open_inputs}]\n\nHeadless/console launch:\n  flutzplayer --headless [--data-dir <dat-directory>]\n\nMedia command relay:\n  flutzplayer --media-command play-pause|stop|next|previous\n\nConsole diagnostics:\n  flutzplayer --verify <{verify_inputs}>\n  flutzplayer --inspect-dat [file.dat|dat-directory]\n  flutzplayer --check-playback <{playback_inputs}> [--data-dir <dat-directory>] [--debug-render-errors]\n  flutzplayer --debug-env\n  flutzplayer --help\n\nData files default to a data folder beside the executable:\n  {}\n\nUse --data-dir to point the player at a different DAT data folder. Use --audio-backend or FLUTZ_AUDIO_BACKEND to choose sdl3 or wasapi. Use --debug-memory to enable jemalloc/domain memory snapshots and session log output in debug builds. Use --debug-latency to write sparse latency JSONL in debug builds. Use --debug-analyzer to write spectrum analyzer JSONL under _local/analyzer-trace. Use --debug-render-errors to capture panic-safe render failure traces and MIDI SysEx interpretation detail under _local/render-error-trace in debug-friendly runs. Launch defaults: Explorer/no-terminal starts GUI; terminal/no-args prints this diagnostic surface; a bare project path opens the GUI directly; --headless always prints this diagnostic surface.",
         default_data_dir.display()
     )
 }

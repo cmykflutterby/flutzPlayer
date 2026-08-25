@@ -12,6 +12,7 @@ members = [
     "crates/flutz_format_mp3",
     "crates/flutz_format_ogg",
     "crates/flutz_format_pcm",
+    "crates/flutz_media_controls",
     "crates/flutz_mixer",
     "crates/flutz_peq",
     "crates/rustystem",

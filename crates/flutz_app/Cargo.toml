@@ -13,6 +13,7 @@ flutz_core = { path = "../flutz_core" }
 flutz_dat = { path = "../flutz_dat" }
 flutz_fmid = { path = "../flutz_fmid" }
 flutz_formats = { path = "../flutz_formats" }
+flutz_media_controls = { path = "../flutz_media_controls" }
 flutz_mixer = { path = "../flutz_mixer" }
 flutz_peq = { path = "../flutz_peq" }
 flutz_synth = { path = "../flutz_synth" }
@@ -24,6 +25,7 @@ egui = "0.33.3"
 damascene-fonts = { version = "0.4.2", default-features = false, features = ["jetbrains-mono", "symbols"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 rfd = "0.15"
+raw-window-handle = "0.6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"

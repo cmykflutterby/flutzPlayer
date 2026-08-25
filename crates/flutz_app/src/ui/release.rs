@@ -1674,7 +1674,11 @@ fn draw_decoded_peq_editor(ui: &mut egui::Ui, app: &mut FlutzDesktopApp, panel_r
         if ui.button("Save PEQ As...").clicked() {
             app.save_decoded_peq_preset_as();
         }
-        if ui.button("sD").on_hover_text("Save current PEQ as the default in preferences.ini").clicked() {
+        if ui
+            .button("sD")
+            .on_hover_text("Save current PEQ as the default in preferences.ini")
+            .clicked()
+        {
             app.save_decoded_peq_default();
         }
         if ui.button("Reset").clicked() {

@@ -26,6 +26,10 @@ use flutz_formats::{
     FormatDescriptor, LoopMode as MediaLoopMode, LoopUnit, MasteringCapability, MediaLoop,
     MetadataField, NativeMetadata, SourceAudioBlock, TrackMetadata,
 };
+use flutz_media_controls::{
+    create_media_controls_backend, should_publish_snapshot, MediaControlCommand,
+    MediaControlsBackend, MediaPlaybackStatus, MediaTrackSnapshot,
+};
 use flutz_mixer::{
     effects::LimiterControls, AutoNormalization, MasterControls as MixerMasterControls,
     MixerSettings, MixerStripControls, SmartMixSettings,
@@ -36,6 +40,8 @@ use flutz_peq::{
 };
 use flutz_synth::{PlaybackLoopMode, PlaybackLoopSettings, SoundFontCoverage};
 use flutz_visualizer_core::VisualizerFrame;
+#[cfg(windows)]
+use raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
 use serde::{Deserialize, Serialize};
 
 use crate::allocation_trace::{AllocationScope, AllocationScopeGuard};
@@ -121,6 +127,30 @@ pub fn run_gui(config: AppStartupConfig) -> Result<()> {
     .map_err(|error| FlutzError::Runtime(format!("failed to start GUI: {error}")))
 }
 
+#[cfg(windows)]
+fn create_media_controls_backend_for_creation_context(
+    creation_context: &eframe::CreationContext<'_>,
+) -> Box<dyn MediaControlsBackend> {
+    let Some(hwnd) = creation_context
+        .window_handle()
+        .ok()
+        .and_then(|handle| match handle.as_raw() {
+            RawWindowHandle::Win32(handle) => Some(handle.hwnd.get()),
+            _ => None,
+        })
+    else {
+        return create_media_controls_backend();
+    };
+    flutz_media_controls::create_media_controls_backend_for_window(hwnd)
+}
+
+#[cfg(not(windows))]
+fn create_media_controls_backend_for_creation_context(
+    _creation_context: &eframe::CreationContext<'_>,
+) -> Box<dyn MediaControlsBackend> {
+    create_media_controls_backend()
+}
+
 pub struct FlutzDesktopApp {
     run_state: AppRunState,
     release_edit_mode: bool,
@@ -155,6 +185,9 @@ pub struct FlutzDesktopApp {
     data_dir: PathBuf,
     data_summary: String,
     playback: PlaybackController,
+    media_controls: Box<dyn MediaControlsBackend>,
+    last_media_controls_snapshot: Option<MediaTrackSnapshot>,
+    last_media_controls_timeline_publish: Option<Instant>,
     perf_trace: PerfTrace,
     latency_trace: LatencyTrace,
     logged_unmatched_snapshot_strips: BTreeSet<RealtimeStripKey>,
@@ -1072,6 +1105,9 @@ impl FlutzDesktopApp {
                 config.debug_analyzer,
                 config.debug_render_errors,
             ),
+            media_controls: create_media_controls_backend_for_creation_context(creation_context),
+            last_media_controls_snapshot: None,
+            last_media_controls_timeline_publish: None,
             perf_trace: PerfTrace::new(config.debug_memory),
             latency_trace: LatencyTrace::new(config.debug_latency),
             logged_unmatched_snapshot_strips: BTreeSet::new(),
@@ -1352,6 +1388,7 @@ impl eframe::App for FlutzDesktopApp {
         self.process_pending_playlist_preload();
         self.refresh_realtime_feedback();
         self.maybe_start_playlist_preload();
+        self.process_media_control_commands();
         let mixer_snapshot = self.mixer_edit_snapshot();
         {
             let _allocation_scope = AllocationScopeGuard::enter(AllocationScope::Ui);
@@ -1360,12 +1397,20 @@ impl eframe::App for FlutzDesktopApp {
         self.apply_mixer_edit_snapshot(mixer_snapshot);
         self.sync_playback_controls();
         self.handle_playback_end_transition();
+        self.publish_media_controls_snapshot();
         self.tick_idle_memory_maintenance();
         context.request_repaint_after(std::time::Duration::from_millis(16));
     }
 
     fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
         visuals.panel_fill.to_normalized_gamma_f32()
+    }
+}
+
+impl Drop for FlutzDesktopApp {
+    fn drop(&mut self) {
+        self.publish_media_controls_shutdown_snapshot();
+        self.media_controls.shutdown();
     }
 }
 
@@ -1648,6 +1693,15 @@ fn note_name(note: u8) -> String {
     ];
     let octave = note as i16 / 12 - 1;
     format!("{}{}", NAMES[note as usize % 12], octave)
+}
+
+fn non_empty_media_metadata(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_owned())
+    }
 }
 
 impl FlutzDesktopApp {
@@ -3428,6 +3482,7 @@ impl FlutzDesktopApp {
                 self.run_state = AppRunState::Idle;
                 self.transport_position = 0.0;
                 self.set_status("Stopped");
+                self.publish_media_controls_snapshot();
                 outcome = "ok";
             }
             Err(error) => self.set_status(format!("{error}")),
@@ -3441,6 +3496,108 @@ impl FlutzDesktopApp {
 
     pub fn data_summary(&self) -> &str {
         &self.data_summary
+    }
+
+    fn process_media_control_commands(&mut self) {
+        loop {
+            let Some(command) = self.media_controls.poll_command() else {
+                break;
+            };
+            self.handle_media_control_command(command);
+        }
+    }
+
+    fn handle_media_control_command(&mut self, command: MediaControlCommand) {
+        match command {
+            MediaControlCommand::Play => self.play(),
+            MediaControlCommand::Pause => self.pause(),
+            MediaControlCommand::TogglePlayPause => {
+                if self.run_state == AppRunState::Playing {
+                    self.pause();
+                } else {
+                    self.play();
+                }
+            }
+            MediaControlCommand::Stop => self.stop(),
+            MediaControlCommand::NextTrack => self.next_track(),
+            MediaControlCommand::PreviousTrack => self.prev_track(),
+            MediaControlCommand::SeekToFraction(fraction) => self.seek_transport_fraction(fraction),
+            MediaControlCommand::SeekBySeconds(seconds) => {
+                let duration = self.transport_duration_seconds();
+                if duration > 0.0 {
+                    let target = (self.transport_seconds() + seconds).clamp(0.0, duration);
+                    self.seek_transport_fraction((target / duration) as f32);
+                }
+            }
+        }
+    }
+
+    fn publish_media_controls_snapshot(&mut self) {
+        let snapshot = self.media_track_snapshot();
+        let timeline_elapsed = self
+            .last_media_controls_timeline_publish
+            .map(|published_at| published_at.elapsed());
+        if !should_publish_snapshot(
+            self.last_media_controls_snapshot.as_ref(),
+            &snapshot,
+            timeline_elapsed,
+        ) {
+            return;
+        }
+        self.media_controls.publish_snapshot(&snapshot);
+        self.last_media_controls_snapshot = Some(snapshot);
+        self.last_media_controls_timeline_publish = Some(Instant::now());
+    }
+
+    fn publish_media_controls_shutdown_snapshot(&mut self) {
+        let mut snapshot = self.media_track_snapshot();
+        snapshot.status = MediaPlaybackStatus::Stopped;
+        snapshot.position_seconds = 0.0;
+        snapshot.can_play = false;
+        snapshot.can_pause = false;
+        snapshot.can_stop = false;
+        snapshot.can_seek = false;
+        snapshot.can_next = false;
+        snapshot.can_previous = false;
+        self.media_controls.publish_snapshot(&snapshot);
+        self.last_media_controls_snapshot = Some(snapshot);
+        self.last_media_controls_timeline_publish = Some(Instant::now());
+    }
+
+    fn media_track_snapshot(&mut self) -> MediaTrackSnapshot {
+        let has_project = self.has_loaded_project();
+        let duration_seconds = self.media_controls_duration_seconds();
+        let position_seconds = self.transport_seconds();
+        let can_previous = self.playlist_has_prev_track();
+        let can_next = self.playlist_has_next_track();
+        let status = match self.run_state {
+            AppRunState::Idle => MediaPlaybackStatus::Stopped,
+            AppRunState::Playing => MediaPlaybackStatus::Playing,
+            AppRunState::Paused => MediaPlaybackStatus::Paused,
+        };
+
+        MediaTrackSnapshot {
+            title: self.project_title().to_owned(),
+            artist: non_empty_media_metadata(&self.metadata_edit_state.artist),
+            album: non_empty_media_metadata(&self.metadata_edit_state.album),
+            source_path: self.current_path().map(PathBuf::from),
+            duration_seconds,
+            position_seconds,
+            can_play: has_project,
+            can_pause: has_project,
+            can_stop: has_project,
+            can_seek: has_project && duration_seconds > 0.0,
+            can_next,
+            can_previous,
+            status,
+        }
+    }
+
+    fn media_controls_duration_seconds(&self) -> f64 {
+        self.playback
+            .decoded_transport_metadata()
+            .map(|metadata| metadata.duration_seconds)
+            .unwrap_or_else(|| self.playback.midi_transport_metadata().duration_seconds)
     }
 
     pub fn playback_summary(&self) -> String {
