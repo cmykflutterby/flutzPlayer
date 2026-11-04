@@ -10,6 +10,8 @@ $Sdl3SrcVersion = "3.4.4"
 $JemallocVersion = "0.6.1"
 $Sdl3SysDestination = Join-Path $Sdl3Root "sdl3-sys-0.6.2+SDL-3.4.4-spacefix"
 $Sdl3SrcDestination = Join-Path $Sdl3Root "sdl3-src-3.4.4"
+$XkbcommonDlRoot = Join-Path $VendorRoot "xkbcommon-dl"
+$VendorPatchRoot = Join-Path $RepoRoot "build\vendor-patches"
 
 function Ensure-Directory {
     param([Parameter(Mandatory = $true)][string]$Path)
@@ -88,6 +90,7 @@ publish = false
 sdl3-sys = "=$Sdl3SysVersion"
 sdl3-src = "=$Sdl3SrcVersion"
 tikv-jemalloc-sys = "=$JemallocVersion"
+xkbcommon-dl = "=$((Read-VendorPins -Path (Join-Path $VendorPatchRoot 'xkbcommon-dl.env')).XKBCOMMON_DL_VERSION)"
 "@
     Set-Content -LiteralPath $mainPath -Value "fn main() {}"
 
@@ -312,6 +315,64 @@ function Copy-CrateSource {
         Patch-Sdl3SysBuildScript -Sdl3SysRoot $DestinationPath
     }
 }
+
+function Read-VendorPins {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $pins = @{}
+    foreach ($line in Get-Content -LiteralPath $Path) {
+        if ($line -match '^\s*([A-Z0-9_]+)=(.*)$') {
+            $pins[$Matches[1]] = $Matches[2].Trim()
+        }
+    }
+
+    return $pins
+}
+
+# Mirrors Initialize-XkbcommonDlSource in build-init.ps1. Cargo requires every
+# [patch.crates-io] path to exist even though Windows never links xkbcommon.
+function Initialize-XkbcommonDlSource {
+    param([Parameter(Mandatory = $true)][string]$DestinationPath)
+
+    $pins = Read-VendorPins -Path (Join-Path $VendorPatchRoot 'xkbcommon-dl.env')
+    $patchFile = Join-Path $VendorPatchRoot $pins.XKBCOMMON_DL_PATCH
+    $stampFile = Join-Path $DestinationPath '.flutz-hydrated'
+    $patchHash = (Get-FileHash -LiteralPath $patchFile -Algorithm SHA256).Hash.ToLowerInvariant()
+    $stamp = "xkbcommon-dl=$($pins.XKBCOMMON_DL_VERSION) patch=$patchHash libxkbcommon=$($pins.LIBXKBCOMMON_SHA256)"
+    if ((Test-Path -LiteralPath $stampFile) -and ((Get-Content -LiteralPath $stampFile -Raw).Trim() -eq $stamp)) {
+        return
+    }
+
+    Remove-PathIfPresent -Path $DestinationPath
+    Copy-CrateSource -CrateName 'xkbcommon-dl' -Version $pins.XKBCOMMON_DL_VERSION -DestinationPath $DestinationPath
+
+    & git -C $RepoRoot apply --directory=vendor/xkbcommon-dl $patchFile
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to apply $patchFile to $DestinationPath"
+    }
+
+    $tarball = Join-Path ([System.IO.Path]::GetTempPath()) "libxkbcommon-$($pins.LIBXKBCOMMON_VERSION).tar.gz"
+    try {
+        Invoke-WebRequest -Uri $pins.LIBXKBCOMMON_URL -OutFile $tarball -UseBasicParsing
+        $actualHash = (Get-FileHash -LiteralPath $tarball -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($actualHash -ne $pins.LIBXKBCOMMON_SHA256) {
+            throw "libxkbcommon $($pins.LIBXKBCOMMON_VERSION) checksum mismatch: expected $($pins.LIBXKBCOMMON_SHA256), got $actualHash"
+        }
+
+        $libRoot = Join-Path $DestinationPath 'libxkbcommon'
+        Ensure-Directory -Path $libRoot
+        & (Join-Path $env:SystemRoot 'System32\tar.exe') -xzf $tarball --strip-components=1 -C $libRoot
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to extract $tarball"
+        }
+    } finally {
+        Remove-PathIfPresent -Path $tarball
+    }
+
+    Set-Content -LiteralPath $stampFile -Value $stamp
+}
+
+Initialize-XkbcommonDlSource -DestinationPath $XkbcommonDlRoot
 
 if ((Test-Path -LiteralPath (Join-Path $Sdl3SysDestination "Cargo.toml")) -and (Test-Path -LiteralPath (Join-Path $JemallocRoot "Cargo.toml"))) {
     Write-Host "Using existing vendored SDL3 source: $Sdl3SysDestination"
