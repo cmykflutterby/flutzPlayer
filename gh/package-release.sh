@@ -58,9 +58,12 @@ diff -u <(printf '%s\n' dat-packer/dat-manifest.toml dat-packer/dat-packer.exe d
     <(file_list "$windows_drop") || fail 'unexpected Windows drop contents'
 diff -u <(printf '%s\n' dat-packer flutzPlayer-x86_64.AppImage flutzplayer metadata.json) \
     <(file_list "$linux_build") || fail 'unexpected Linux build contents'
-cmp -s -- "$source_root/assets/dat-manifest.toml" "$windows_drop/dat-packer/dat-manifest.toml" ||
+# The Windows runner checks out with CRLF; those copies ship as-is, as in earlier
+# Windows releases, so compare content independent of line endings.
+same_text() { cmp -s <(tr -d '\r' <"$1") <(tr -d '\r' <"$2"); }
+same_text "$source_root/assets/dat-manifest.toml" "$windows_drop/dat-packer/dat-manifest.toml" ||
     fail 'Windows DAT manifest differs from the source'
-cmp -s -- "$source_root/tools/dat-packer/pack-dat.ps1" "$windows_drop/dat-packer/pack-dat.ps1" ||
+same_text "$source_root/tools/dat-packer/pack-dat.ps1" "$windows_drop/dat-packer/pack-dat.ps1" ||
     fail 'Windows pack-dat.ps1 differs from the source'
 
 metadata="$linux_build/metadata.json"
