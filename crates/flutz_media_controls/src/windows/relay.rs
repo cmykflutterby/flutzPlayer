@@ -1,11 +1,10 @@
 #![allow(unsafe_code)]
 
 use std::{
-    collections::VecDeque,
     ptr,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        Arc,
     },
     thread::{self, JoinHandle},
 };
@@ -29,6 +28,8 @@ use windows_sys::{
 
 use crate::{media_command_argument, media_command_from_argument, MediaControlCommand};
 
+use super::CommandQueue;
+
 const MEDIA_COMMAND_PIPE_NAME: &str = r"\\.\pipe\flutzplayer-media-controls";
 const MEDIA_COMMAND_PIPE_TIMEOUT_MS: u32 = 250;
 const MEDIA_COMMAND_PIPE_BUFFER_BYTES: u32 = 128;
@@ -48,9 +49,7 @@ impl WindowsMediaCommandRelayServer {
     }
 }
 
-pub fn start_command_server(
-    commands: Arc<Mutex<VecDeque<MediaControlCommand>>>,
-) -> Option<WindowsMediaCommandRelayServer> {
+pub fn start_command_server(commands: CommandQueue) -> Option<WindowsMediaCommandRelayServer> {
     let running = Arc::new(AtomicBool::new(true));
     let server_running = Arc::clone(&running);
     let thread = thread::Builder::new()
@@ -68,10 +67,7 @@ pub fn send_command_to_running_instance(command: MediaControlCommand) -> bool {
     media_command_argument(&command).is_some_and(write_command_text)
 }
 
-fn run_command_server(
-    running: Arc<AtomicBool>,
-    commands: Arc<Mutex<VecDeque<MediaControlCommand>>>,
-) {
+fn run_command_server(running: Arc<AtomicBool>, commands: CommandQueue) {
     let pipe_name = wide_null(MEDIA_COMMAND_PIPE_NAME);
     while running.load(Ordering::Acquire) {
         let pipe = unsafe {
@@ -105,7 +101,7 @@ fn run_command_server(
     }
 }
 
-fn read_one_command(pipe: HANDLE, commands: &Arc<Mutex<VecDeque<MediaControlCommand>>>) {
+fn read_one_command(pipe: HANDLE, commands: &CommandQueue) {
     let mut buffer = [0u8; MEDIA_COMMAND_PIPE_BUFFER_BYTES as usize];
     let mut read = 0u32;
     let ok = unsafe {
@@ -125,9 +121,7 @@ fn read_one_command(pipe: HANDLE, commands: &Arc<Mutex<VecDeque<MediaControlComm
     let Some(command) = media_command_from_argument(&text) else {
         return;
     };
-    if let Ok(mut commands) = commands.lock() {
-        commands.push_back(command);
-    }
+    commands.push(command);
 }
 
 fn write_command_text(command: &str) -> bool {

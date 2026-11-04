@@ -1,3 +1,5 @@
+#![cfg(windows)]
+
 use std::{
     sync::atomic::{AtomicU64, Ordering},
     sync::{mpsc, Arc, Condvar, Mutex},

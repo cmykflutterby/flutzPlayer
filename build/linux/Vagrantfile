@@ -1,0 +1,75 @@
+Vagrant.configure("2") do |config|
+  required = lambda do |name|
+    value = ENV[name]
+    abort "Required environment variable #{name} is not set." if value.nil? || value.strip.empty?
+    value
+  end
+
+  vm_name = required.call("FLUTZ_LINUX_VM_NAME")
+  bridge_adapter = required.call("FLUTZ_LINUX_BRIDGE_ADAPTER")
+  rdp_source_cidr = required.call("FLUTZ_LINUX_RDP_SOURCE_CIDR")
+  credential_file = required.call("FLUTZ_LINUX_RDP_CREDENTIAL_FILE")
+  guest_source_path = required.call("FLUTZ_LINUX_GUEST_SOURCE_PATH")
+  guest_artifact_path = required.call("FLUTZ_LINUX_GUEST_ARTIFACT_PATH")
+  guest_manifest_path = required.call("FLUTZ_LINUX_GUEST_MANIFEST_PATH")
+  guest_hostname = required.call("FLUTZ_LINUX_GUEST_HOSTNAME")
+  provisioning_fingerprint = required.call("FLUTZ_LINUX_PROVISIONING_FINGERPRINT")
+  cpus = Integer(required.call("FLUTZ_LINUX_VM_CPUS"), 10)
+  memory_mb = Integer(required.call("FLUTZ_LINUX_VM_MEMORY_MB"), 10)
+  disk_gb = Integer(required.call("FLUTZ_LINUX_VM_DISK_GB"), 10)
+
+  abort "RDP credential file does not exist: #{credential_file}" unless File.file?(credential_file)
+
+  config.vm.box = "flutzplayer/ubuntu-26.04.1-x86_64"
+  config.vm.hostname = guest_hostname
+  config.vm.boot_timeout = 1800
+  config.vm.graceful_halt_timeout = 180
+  config.vm.synced_folder ".", "/vagrant", disabled: true
+  config.ssh.insert_key = false
+  unless ENV["FLUTZ_LINUX_SSH_HOST"].nil? || ENV["FLUTZ_LINUX_SSH_HOST"].strip.empty?
+    config.ssh.host = ENV["FLUTZ_LINUX_SSH_HOST"]
+    config.ssh.port = Integer(ENV.fetch("FLUTZ_LINUX_SSH_PORT", "22"), 10)
+  end
+
+  config.vm.network "public_network",
+    bridge: bridge_adapter,
+    auto_config: true,
+    use_dhcp_assigned_default_route: false
+
+  config.vm.disk :disk, size: "#{disk_gb}GB", primary: true
+
+  config.vm.provider "virtualbox" do |vb|
+    vb.name = vm_name
+    vb.cpus = cpus
+    vb.memory = memory_mb
+    vb.customize ["modifyvm", :id, "--audio-driver", "default"]
+    vb.customize ["modifyvm", :id, "--audio-controller", "ac97"]
+    vb.customize ["modifyvm", :id, "--audio-enabled", "on"]
+    vb.customize ["modifyvm", :id, "--audio-out", "on"]
+  end
+
+  config.vm.provision "file",
+    source: File.expand_path("tool-versions.json", __dir__),
+    destination: "/tmp/flutzplayer-tool-versions.json"
+  config.vm.provision "file",
+    source: File.expand_path("provision/provisioning-manifest.schema.json", __dir__),
+    destination: "/tmp/flutzplayer-provisioning-manifest.schema.json"
+  config.vm.provision "file",
+    source: File.expand_path("provision/configure-gnome-remote-desktop.sh", __dir__),
+    destination: "/tmp/flutzplayer-configure-gnome-remote-desktop.sh"
+  config.vm.provision "file",
+    source: File.expand_path("provision/verify-environment.sh", __dir__),
+    destination: "/tmp/flutzplayer-verify-environment.sh"
+  config.vm.provision "file",
+    source: credential_file,
+    destination: "/tmp/flutzplayer-rdp-credentials.json"
+  config.vm.provision "shell",
+    path: File.expand_path("provision/provision.sh", __dir__),
+    args: [
+      guest_source_path,
+      guest_artifact_path,
+      guest_manifest_path,
+      rdp_source_cidr,
+      provisioning_fingerprint
+    ]
+end

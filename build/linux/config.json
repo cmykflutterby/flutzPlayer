@@ -1,0 +1,47 @@
+{
+  "schemaId": "https://flutzplayer.local/schemas/linux-build-config/v1",
+  "provisioningSchemaId": "https://flutzplayer.local/schemas/linux-provisioning-manifest/v1",
+  "vm": {
+    "name": "flutzplayer-ubuntu-26-04",
+    "ubuntuRelease": "26.04.1",
+    "architecture": "x86_64",
+    "cpus": 4,
+    "memoryMb": 8192,
+    "diskGb": 80,
+    "guestSourcePath": "/home/vagrant/flutzPlayer-src",
+    "guestArtifactPath": "/home/vagrant/flutzPlayer-artifacts",
+    "guestManifestPath": "/var/lib/flutzplayer-build/provisioning-manifest.json",
+    "network": {
+      "managementAdapter": "nat",
+      "lanAdapter": "bridged",
+      "lanAddressMode": "dhcp",
+      "bridgeAdapter": "",
+      "rdpSourceCidr": "",
+      "hostname": "flutzplayer-build"
+    }
+  },
+  "overrideEnvironmentVariables": {
+    "name": "FLUTZ_LINUX_VM_NAME",
+    "cpus": "FLUTZ_LINUX_VM_CPUS",
+    "memoryMb": "FLUTZ_LINUX_VM_MEMORY_MB",
+    "diskGb": "FLUTZ_LINUX_VM_DISK_GB",
+    "guestSourcePath": "FLUTZ_LINUX_GUEST_SOURCE_PATH",
+    "guestArtifactPath": "FLUTZ_LINUX_GUEST_ARTIFACT_PATH",
+    "bridgeAdapter": "FLUTZ_LINUX_BRIDGE_ADAPTER",
+    "lanAddressMode": "FLUTZ_LINUX_LAN_ADDRESS_MODE",
+    "rdpSourceCidr": "FLUTZ_LINUX_RDP_SOURCE_CIDR",
+    "hostname": "FLUTZ_LINUX_GUEST_HOSTNAME"
+  },
+  "validation": {
+    "cpus": { "minimum": 2, "maximum": 32 },
+    "memoryMb": { "minimum": 4096, "maximum": 131072 },
+    "diskGb": { "minimum": 40, "maximum": 2048 },
+    "lanAddressModes": [ "dhcp", "static" ]
+  },
+  "exitStates": {
+    "ready": 0,
+    "fatal": 1,
+    "repaired": 10,
+    "restartRequired": 20
+  }
+}

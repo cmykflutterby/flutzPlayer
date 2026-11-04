@@ -1,0 +1,37 @@
+# Repository and VM state
+/.git/
+/.vagrant/
+/_local/
+/drops/
+/vendor/
+/.cargo/config.toml
+/MIDI Files/
+/design-docs/
+
+# Build output from either host platform
+**/target/
+**/AppDir/
+**/*.AppImage
+**/*.AppImage.zsync
+**/*-x86_64.tar.gz
+**/*-x86_64.tar.gz.sha256
+**/*.tar.gz.sha256
+
+# Windows binaries and staged native output
+**/*.exe
+**/*.dll
+**/*.pdb
+**/*.lib
+**/*.exp
+**/*.ilk
+
+# Editor, analyzer, and OS metadata
+/.vs/
+/.vscode/
+/.idea/
+**/.DS_Store
+**/Thumbs.db
+**/desktop.ini
+**/*~
+**/*.swp
+**/*.swo

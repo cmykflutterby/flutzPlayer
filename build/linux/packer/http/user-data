@@ -1,0 +1,30 @@
+#cloud-config
+autoinstall:
+  version: 1
+  locale: en_US.UTF-8
+  keyboard:
+    layout: us
+  identity:
+    hostname: flutzplayer-base
+    username: vagrant
+    # Standard disposable Vagrant development password hash; SSH password login is disabled.
+    password: "$6$flutzbox$uq6.tpWVUJCyM6ngpXRIiglQ2F3wDBXPuZ5LajWkUk6qtDZhRxMRYL4h4aFnuArWSavY8XFxM8c68rKhvQGe.."
+  ssh:
+    install-server: true
+    # Enabled only for the NAT-isolated Packer install; provisioning disables it before packaging.
+    allow-pw: true
+    authorized-keys:
+      - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIN1YdxBpNlzxDqfJyw/QKow1F+wvG9hXGoqiysfJOn5Y vagrant insecure public key
+      - ssh-rsa AAAAB3NzaC1yc2EAAAABIwAAAQEA6NF8iallvQVp22WDkTkyrtvp9eWW6A8YVr+kz4TjGYe7gHzIw+niNltGEFHzD8+v1I2YJ6oXevct1YeS0o9HZyN1Q9qgCgzUFtdOKLv6IedplqoPkcmF0aYet2PkEDo3MlTBckFXPITAMzF8dJSIFo9D8HfdOV0IAdx4O7PtixWKn5y2hMNG0zQPyUecp4pzC6kivAIhyfHilFR61RGL+GPXQ2MWZWFYbAGjyiYJnAmCP3NOTd0jMZEnDkbUvxhMmBYSdETk1rRgm+R4LOzFUGaHqHDLKLX+FIPKcF96hrucXzcWyLbIbEgE98OHlnVYCzRdK8jlqm8tehUc9c9WhQ== vagrant insecure public key
+  storage:
+    layout:
+      name: direct
+  packages:
+    - openssh-server
+    - virtualbox-guest-utils
+    - virtualbox-guest-x11
+  late-commands:
+    - curtin in-target --target=/target -- systemctl enable ssh
+    - curtin in-target --target=/target -- sh -c "echo 'vagrant ALL=(ALL) NOPASSWD:ALL' >/etc/sudoers.d/99-vagrant"
+    - curtin in-target --target=/target -- chmod 0440 /etc/sudoers.d/99-vagrant
+  shutdown: reboot

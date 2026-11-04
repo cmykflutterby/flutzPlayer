@@ -1,9 +1,6 @@
 #![allow(unsafe_code)]
 
-use std::{
-    collections::VecDeque,
-    sync::{Arc, Mutex},
-};
+use std::sync::{Arc, Mutex};
 
 use windows::{
     core::{factory, Ref, Result, HSTRING},
@@ -17,9 +14,15 @@ use windows::{
     Win32::{Foundation::HWND, System::WinRT::ISystemMediaTransportControlsInterop},
 };
 
-use crate::{MediaControlCommand, MediaControlsBackend, MediaPlaybackStatus, MediaTrackSnapshot};
+use crate::{
+    MediaCommandWaker, MediaControlCommand, MediaControlsBackend, MediaPlaybackStatus,
+    MediaTrackSnapshot,
+};
 
-use super::relay::{self, WindowsMediaCommandRelayServer};
+use super::{
+    relay::{self, WindowsMediaCommandRelayServer},
+    CommandQueue,
+};
 
 const WINDOWS_TIMESPAN_TICKS_PER_SECOND: f64 = 10_000_000.0;
 
@@ -27,7 +30,7 @@ pub struct WindowsMediaControlsBackend {
     controls: SystemMediaTransportControls,
     button_pressed_token: Option<i64>,
     position_requested_token: Option<i64>,
-    commands: Arc<Mutex<VecDeque<MediaControlCommand>>>,
+    commands: CommandQueue,
     relay_server: Option<WindowsMediaCommandRelayServer>,
     duration_seconds: Arc<Mutex<Option<f64>>>,
     last_snapshot: Option<MediaTrackSnapshot>,
@@ -41,9 +44,9 @@ impl WindowsMediaControlsBackend {
             unsafe { interop.GetForWindow(HWND(hwnd as _))? };
         controls.SetIsEnabled(true)?;
 
-        let commands = Arc::new(Mutex::new(VecDeque::new()));
+        let commands = CommandQueue::default();
         let duration_seconds: Arc<Mutex<Option<f64>>> = Arc::new(Mutex::new(None));
-        let button_commands = Arc::clone(&commands);
+        let button_commands = commands.clone();
         let button_pressed_token = controls.ButtonPressed(&TypedEventHandler::new(
             move |_sender: Ref<SystemMediaTransportControls>,
                   args: Ref<SystemMediaTransportControlsButtonPressedEventArgs>| {
@@ -52,15 +55,13 @@ impl WindowsMediaControlsBackend {
                     .and_then(|args| args.Button().ok())
                     .and_then(command_from_button)
                 {
-                    if let Ok(mut commands) = button_commands.lock() {
-                        commands.push_back(command);
-                    }
+                    button_commands.push(command);
                 }
                 Ok(())
             },
         ))?;
 
-        let position_commands = Arc::clone(&commands);
+        let position_commands = commands.clone();
         let position_duration_seconds = Arc::clone(&duration_seconds);
         let position_requested_token =
             controls.PlaybackPositionChangeRequested(&TypedEventHandler::new(
@@ -74,22 +75,20 @@ impl WindowsMediaControlsBackend {
                             .lock()
                             .ok()
                             .and_then(|duration| *duration);
-                        if let Ok(mut commands) = position_commands.lock() {
-                            if let Some(duration_seconds) =
-                                duration_seconds.filter(|duration| *duration > 0.0)
-                            {
-                                commands.push_back(MediaControlCommand::SeekToFraction(
-                                    (seconds_from_timespan(position) / duration_seconds)
-                                        .clamp(0.0, 1.0) as f32,
-                                ));
-                            }
+                        if let Some(duration_seconds) =
+                            duration_seconds.filter(|duration| *duration > 0.0)
+                        {
+                            position_commands.push(MediaControlCommand::SeekToFraction(
+                                (seconds_from_timespan(position) / duration_seconds)
+                                    .clamp(0.0, 1.0) as f32,
+                            ));
                         }
                     }
                     Ok(())
                 },
             ))?;
 
-        let relay_server = relay::start_command_server(Arc::clone(&commands));
+        let relay_server = relay::start_command_server(commands.clone());
 
         Ok(Self {
             controls,
@@ -152,14 +151,15 @@ impl WindowsMediaControlsBackend {
 
 impl MediaControlsBackend for WindowsMediaControlsBackend {
     fn poll_command(&mut self) -> Option<MediaControlCommand> {
-        self.commands
-            .lock()
-            .ok()
-            .and_then(|mut commands| commands.pop_front())
+        self.commands.pop()
     }
 
     fn publish_snapshot(&mut self, snapshot: &MediaTrackSnapshot) {
         let _ = self.publish_snapshot_inner(snapshot);
+    }
+
+    fn set_command_waker(&mut self, waker: MediaCommandWaker) {
+        self.commands.set_waker(waker);
     }
 
     fn shutdown(&mut self) {

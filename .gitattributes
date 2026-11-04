@@ -1,0 +1,7 @@
+/build/linux/sync/*.sh text eol=lf
+/build/linux/provision/*.sh text eol=lf
+/build/linux/scripts/*.sh text eol=lf
+/build/linux/appimage/*.desktop text eol=lf
+/build/linux/appimage/*.txt text eol=lf
+/build/linux/appimage/AppRun text eol=lf
+/build/vendor-patches/** -text

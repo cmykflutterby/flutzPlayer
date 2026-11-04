@@ -8,11 +8,11 @@ name = "flutz_app"
 
 [dependencies]
 flutz_audio_sdl3 = { path = "../flutz_audio_sdl3" }
-flutz_audio_wasapi = { path = "../flutz_audio_wasapi" }
 flutz_core = { path = "../flutz_core" }
 flutz_dat = { path = "../flutz_dat" }
 flutz_fmid = { path = "../flutz_fmid" }
 flutz_formats = { path = "../flutz_formats" }
+flutz_fs_sdl3 = { path = "../flutz_fs_sdl3" }
 flutz_media_controls = { path = "../flutz_media_controls" }
 flutz_mixer = { path = "../flutz_mixer" }
 flutz_peq = { path = "../flutz_peq" }
@@ -38,7 +38,12 @@ ico = "0.4"
 image = { version = "0.25", default-features = false, features = ["png"] }
 winresource = "0.1"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# Links libxkbcommon/-x11 into the binary so X11 sessions don't need them installed.
+xkbcommon-dl = { version = "0.4.2", features = ["static", "x11"] }
+
 [target.'cfg(windows)'.dependencies]
+flutz_audio_wasapi = { path = "../flutz_audio_wasapi" }
 windows = { version = "0.62", features = [
 	"Win32_Foundation",
 	"Win32_System_Com",

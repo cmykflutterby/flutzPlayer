@@ -6,6 +6,8 @@ description = "Experimental WASAPI audio-output wrapper primitives."
 
 [dependencies]
 flutz_audio_sdl3 = { path = "../flutz_audio_sdl3" }
+
+[target.'cfg(windows)'.dependencies]
 wasapi = "0.23"
 
 [lints]

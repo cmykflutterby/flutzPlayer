@@ -31,7 +31,7 @@ percussion_requires_bank_128 = true
 id = "retro"
 display_name = "Retro Synths"
 description = "Retro 8/16-bit Hardware Blend"
-font_ids = ["roland_sc_55","megadrive","snes","8bit"]
+font_ids = ["roland_sc_55","retro"]
 blend_mode = "blend-even"
 
 [[presets]]
@@ -45,11 +45,11 @@ blend_mode = "blend-weight"
 # - every font_id in this preset's font_ids must have an entry
 # - every weight must be a positive integer (>0)
 # - if a font does not provide a strip, its weight is excluded for that strip's share math
-weights = { roland_sc_55 = 30, opl3 = 20, sbhq = 20 }
+weights = { roland_sc_55 = 35, opl3 = 20, sbhq = 45 }
 
 [[presets]]
 id = "dos"
-display_name = "dos"
+display_name = "DOS"
 description = "DOS OPL"
 font_ids = ["retro","opl3"]
 blend_mode = "blend-even"

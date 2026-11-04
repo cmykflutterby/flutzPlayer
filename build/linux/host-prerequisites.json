@@ -1,0 +1,77 @@
+{
+  "schemaId": "https://flutzplayer.local/schemas/windows-host-prerequisites/v1",
+  "powershell": {
+    "desktopMinimum": "5.1",
+    "coreMinimum": "7.4"
+  },
+  "wingetPackages": [
+    {
+      "name": "VirtualBox",
+      "id": "Oracle.VirtualBox",
+      "publisher": "Oracle and/or its affiliates",
+      "command": "VBoxManage",
+      "candidatePaths": [
+        "C:\\Program Files\\Oracle\\VirtualBox\\VBoxManage.exe"
+      ]
+    },
+    {
+      "name": "Vagrant",
+      "id": "Hashicorp.Vagrant",
+      "publisher": "HashiCorp",
+      "command": "vagrant",
+      "candidatePaths": [
+        "C:\\Program Files\\Vagrant\\bin\\vagrant.exe",
+        "C:\\HashiCorp\\Vagrant\\bin\\vagrant.exe"
+      ]
+    },
+    {
+      "name": "Packer",
+      "id": "Hashicorp.Packer",
+      "publisher": "HashiCorp",
+      "command": "packer",
+      "candidatePaths": [
+        "%LOCALAPPDATA%\\Microsoft\\WinGet\\Links\\packer.exe",
+        "C:\\Program Files\\Packer\\packer.exe",
+        "C:\\HashiCorp\\Packer\\packer.exe"
+      ]
+    },
+    {
+      "name": "MSYS2",
+      "id": "MSYS2.MSYS2",
+      "publisher": "The MSYS2 Developers",
+      "command": "bash",
+      "candidatePaths": [
+        "C:\\msys64\\usr\\bin\\bash.exe"
+      ]
+    }
+  ],
+  "msys2": {
+    "root": "C:\\msys64",
+    "packages": [
+      "bash",
+      "coreutils",
+      "grep",
+      "sed",
+      "gawk",
+      "make",
+      "rsync",
+      "openssh",
+      "base-devel",
+      "mingw-w64-x86_64-toolchain"
+    ],
+    "requiredCommands": [
+      "bash",
+      "sed",
+      "grep",
+      "expr",
+      "gawk",
+      "make",
+      "ar",
+      "nm",
+      "install",
+      "gcc",
+      "rsync",
+      "ssh"
+    ]
+  }
+}

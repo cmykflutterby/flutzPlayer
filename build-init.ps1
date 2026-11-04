@@ -1,17 +1,206 @@
 [CmdletBinding()]
 param(
+    [string]$OS = 'Windows',
+
     [Alias('Teardown')]
-    [switch]$Clean
+    [switch]$Clean,
+
+    [switch]$DestroyVm,
+
+    [switch]$Force,
+
+    [Parameter(ValueFromRemainingArguments = $true)]
+    [string[]]$RemainingArguments
 )
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
-
 $RepoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+$LinuxBuildRoot = Join-Path $RepoRoot 'build\linux'
+$LinuxConfigPath = Join-Path $LinuxBuildRoot 'config.json'
+$LinuxContractPath = Join-Path $LinuxBuildRoot 'LinuxBuildContract.ps1'
+$HostPrerequisiteConfigPath = Join-Path $LinuxBuildRoot 'host-prerequisites.json'
+$HostPrerequisiteScriptPath = Join-Path $LinuxBuildRoot 'WindowsHostPrerequisites.ps1'
+$UbuntuBaseBoxScriptPath = Join-Path $LinuxBuildRoot 'UbuntuBaseBox.ps1'
+$LinuxDevelopmentVmScriptPath = Join-Path $LinuxBuildRoot 'LinuxDevelopmentVm.ps1'
+$LinuxSourceSyncScriptPath = Join-Path $LinuxBuildRoot 'LinuxSourceSync.ps1'
+$Remaining = @($RemainingArguments | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+
+if ($OS -in @('--OS', '-OS')) {
+    if ($Remaining.Count -eq 0) {
+        throw 'The --OS spelling requires exactly one value: --OS Windows or --OS Linux'
+    }
+    $OS = $Remaining[0]
+    $Remaining = @($Remaining | Select-Object -Skip 1)
+} elseif ($OS.StartsWith('--OS=')) {
+    $OS = $OS.Substring(5)
+}
+
+$normalizedRemaining = [System.Collections.Generic.List[string]]::new()
+for ($index = 0; $index -lt $Remaining.Count; $index++) {
+    $argument = $Remaining[$index]
+    if ($argument -in @('--OS', '-OS')) {
+        $index++
+        if ($index -ge $Remaining.Count) {
+            throw 'The --OS spelling requires exactly one value: --OS Windows or --OS Linux'
+        }
+        $OS = $Remaining[$index]
+    } elseif ($argument.StartsWith('--OS=')) {
+        $OS = $argument.Substring(5)
+    } else {
+        $normalizedRemaining.Add($argument)
+    }
+}
+$Remaining = @($normalizedRemaining)
+
+if ($OS -notin @('Windows', 'Linux')) {
+    throw "Unsupported OS '$OS'. Expected Windows or Linux."
+}
+
+foreach ($argument in $Remaining) {
+    if ([string]::IsNullOrWhiteSpace($argument)) {
+        continue
+    }
+    switch ($argument) {
+        '-Clean' { $Clean = $true }
+        '--Clean' { $Clean = $true }
+        '-DestroyVm' { $DestroyVm = $true }
+        '--DestroyVm' { $DestroyVm = $true }
+        '-Force' { $Force = $true }
+        '--Force' { $Force = $true }
+        default { throw "Unexpected argument '$argument'." }
+    }
+}
+
+if ($OS -eq 'Windows' -and ($DestroyVm -or $Force)) {
+    throw '-DestroyVm and -Force apply only when -OS Linux is selected.'
+}
+if ($Force -and -not $DestroyVm) {
+    throw '-Force is valid only with -DestroyVm.'
+}
+if ($DestroyVm -and -not $Force) {
+    throw 'Destroying the Linux VM requires explicit confirmation with -Force (or --Force in the compatibility spelling).'
+}
+if ($DestroyVm -and $Clean) {
+    throw '-Clean and -DestroyVm are separate operations and cannot be combined.'
+}
+
+if ($OS -eq 'Linux') {
+    if (-not (Test-Path -LiteralPath $LinuxContractPath -PathType Leaf)) {
+        throw "Linux build contract not found: $LinuxContractPath"
+    }
+    . $LinuxContractPath
+    $vmWorkRoot = Join-Path $RepoRoot '_local\linux\development-vm'
+    $vmSettingsPath = Join-Path $vmWorkRoot 'settings.json'
+    $localOverrides = @{}
+    if (Test-Path -LiteralPath $LinuxDevelopmentVmScriptPath -PathType Leaf) {
+        . $LinuxDevelopmentVmScriptPath
+        $localOverrides = Get-LocalDevelopmentVmOverrides -Path $vmSettingsPath
+    }
+    $linuxConfig = Get-LinuxBuildConfiguration -ConfigPath $LinuxConfigPath -Overrides $localOverrides
+    $exitStates = Get-LinuxBuildExitStates -ConfigPath $LinuxConfigPath
+    if (-not (Test-Path -LiteralPath $HostPrerequisiteScriptPath -PathType Leaf)) {
+        throw "Windows host prerequisite implementation not found: $HostPrerequisiteScriptPath"
+    }
+    . $HostPrerequisiteScriptPath
+    $hostWorkRoot = Join-Path $RepoRoot '_local\linux\host-prerequisites'
+    New-Item -ItemType Directory -Force -Path $hostWorkRoot | Out-Null
+    $result = Initialize-WindowsHostPrerequisites `
+        -ConfigPath $HostPrerequisiteConfigPath `
+        -RepoRoot $RepoRoot `
+        -WorkRoot $hostWorkRoot
+    Write-Host $result.Message
+    if ($result.State -eq 'restartRequired') {
+        exit $exitStates.RestartRequired
+    }
+    if ($result.State -notin @('ready', 'repaired')) {
+        throw "Unknown host prerequisite state '$($result.State)'."
+    }
+    if (-not (Test-Path -LiteralPath $UbuntuBaseBoxScriptPath -PathType Leaf)) {
+        throw "Ubuntu base-box implementation not found: $UbuntuBaseBoxScriptPath"
+    }
+
+    $hostConfig = Read-HostPrerequisiteConfig -Path $HostPrerequisiteConfigPath
+    $vagrantPackage = $hostConfig.wingetPackages | Where-Object name -eq 'Vagrant'
+    $packerPackage = $hostConfig.wingetPackages | Where-Object name -eq 'Packer'
+    $virtualBoxPackage = $hostConfig.wingetPackages | Where-Object name -eq 'VirtualBox'
+    $vagrant = Resolve-HostExecutable -Command $vagrantPackage.command -CandidatePaths $vagrantPackage.candidatePaths
+    $vboxManage = Resolve-HostExecutable -Command $virtualBoxPackage.command -CandidatePaths $virtualBoxPackage.candidatePaths
+    $networkDefaults = Resolve-DevelopmentVmNetworkDefaults -Configuration $linuxConfig -VBoxManage $vboxManage
+    if ($networkDefaults.Count -gt 0) {
+        foreach ($entry in $networkDefaults.GetEnumerator()) {
+            $localOverrides[$entry.Key] = $entry.Value
+        }
+        $linuxConfig = Get-LinuxBuildConfiguration -ConfigPath $LinuxConfigPath -Overrides $localOverrides
+    }
+    if ($DestroyVm) {
+        $destroyResult = Remove-LinuxDevelopmentVm `
+            -Vagrant $vagrant `
+            -VagrantRoot $LinuxBuildRoot `
+            -WorkRoot $vmWorkRoot `
+            -Configuration $linuxConfig
+        Write-Host $destroyResult.Message
+        if ($destroyResult.State -eq 'repaired') {
+            exit $exitStates.Repaired
+        }
+        exit $exitStates.Ready
+    }
+    if ($Clean) {
+        $cleanResult = Clear-LinuxDevelopmentBuildState `
+            -Vagrant $vagrant `
+            -VagrantRoot $LinuxBuildRoot `
+            -WorkRoot $vmWorkRoot `
+            -RepoRoot $RepoRoot `
+            -Configuration $linuxConfig
+        Write-Host $cleanResult.Message
+        exit $exitStates.Repaired
+    }
+
+    $packer = Resolve-HostExecutable -Command $packerPackage.command -CandidatePaths $packerPackage.candidatePaths
+    $curl = Resolve-HostExecutable -Command 'curl.exe' -CandidatePaths @(
+        (Join-Path $env:SystemRoot 'System32\curl.exe')
+    )
+    if (-not $curl) {
+        throw 'Windows curl.exe is required to download the checksum-pinned Ubuntu ISO.'
+    }
+
+    . $UbuntuBaseBoxScriptPath
+    $boxWorkRoot = Join-Path $RepoRoot '_local\linux\ubuntu-base-box'
+    $boxResult = Initialize-UbuntuBaseBox `
+        -RepoRoot $RepoRoot `
+        -WorkRoot $boxWorkRoot `
+        -Packer $packer `
+        -Vagrant $vagrant `
+        -Curl $curl
+    Write-Host $boxResult.Message
+    if (-not (Test-Path -LiteralPath $LinuxDevelopmentVmScriptPath -PathType Leaf)) {
+        throw "Linux development VM implementation not found: $LinuxDevelopmentVmScriptPath"
+    }
+    if (-not (Test-Path -LiteralPath $LinuxSourceSyncScriptPath -PathType Leaf)) {
+        throw "Linux SSH connectivity implementation not found: $LinuxSourceSyncScriptPath"
+    }
+    . $LinuxSourceSyncScriptPath
+    $msysPaths = Get-MsysPaths -Config $hostConfig
+    $vmResult = Initialize-LinuxDevelopmentVm `
+        -Vagrant $vagrant `
+        -VBoxManage $vboxManage `
+        -VagrantRoot $LinuxBuildRoot `
+        -WorkRoot $vmWorkRoot `
+        -Configuration $linuxConfig `
+        -MsysPaths $msysPaths
+    Write-Host $vmResult.Message
+    if ($result.State -eq 'repaired' -or $boxResult.State -eq 'repaired' -or $vmResult.State -eq 'repaired') {
+        exit $exitStates.Repaired
+    }
+    exit $exitStates.Ready
+}
+
 $VendorRoot = Join-Path $RepoRoot 'vendor'
 $Sdl3Root = Join-Path $VendorRoot 'SDL3'
 $Sdl3SysRoot = Join-Path $Sdl3Root 'sdl3-sys-0.6.2+SDL-3.4.4-spacefix'
 $JemallocRoot = Join-Path $VendorRoot 'tikv-jemalloc-sys'
+$XkbcommonDlRoot = Join-Path $VendorRoot 'xkbcommon-dl'
+$VendorPatchRoot = Join-Path $RepoRoot 'build\vendor-patches'
 $CargoRoot = Join-Path $RepoRoot '.cargo'
 $CargoConfig = Join-Path $CargoRoot 'config.toml'
 $LocalRoot = Join-Path $RepoRoot '_local'
@@ -154,6 +343,7 @@ publish = false
 [dependencies]
 sdl3-sys = "=0.6.2+SDL-3.4.4"
 tikv-jemalloc-sys = "=0.6.1"
+xkbcommon-dl = "=0.4.2"
 '@
     Set-Content -LiteralPath $mainPath -Value 'fn main() {}'
 
@@ -287,6 +477,62 @@ function Copy-CrateSource {
     }
 }
 
+function Read-VendorPins {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $pins = @{}
+    foreach ($line in Get-Content -LiteralPath $Path) {
+        if ($line -match '^\s*([A-Z0-9_]+)=(.*)$') {
+            $pins[$Matches[1]] = $Matches[2].Trim()
+        }
+    }
+
+    return $pins
+}
+
+# Mirrors hydrate_xkbcommon_dl in build/linux/sync/hydrate-linux-source.sh.
+function Initialize-XkbcommonDlSource {
+    param([Parameter(Mandatory = $true)][string]$DestinationPath)
+
+    $pins = Read-VendorPins -Path (Join-Path $VendorPatchRoot 'xkbcommon-dl.env')
+    $patchFile = Join-Path $VendorPatchRoot $pins.XKBCOMMON_DL_PATCH
+    $stampFile = Join-Path $DestinationPath '.flutz-hydrated'
+    $patchHash = (Get-FileHash -LiteralPath $patchFile -Algorithm SHA256).Hash.ToLowerInvariant()
+    $stamp = "xkbcommon-dl=$($pins.XKBCOMMON_DL_VERSION) patch=$patchHash libxkbcommon=$($pins.LIBXKBCOMMON_SHA256)"
+    if ((Test-Path -LiteralPath $stampFile) -and ((Get-Content -LiteralPath $stampFile -Raw).Trim() -eq $stamp)) {
+        return
+    }
+
+    Remove-PathIfPresent -Path $DestinationPath
+    Copy-CrateSource -CrateName 'xkbcommon-dl' -Version $pins.XKBCOMMON_DL_VERSION -DestinationPath $DestinationPath
+
+    # --directory keeps patch paths relative to the crate even though vendor/ sits inside this repository.
+    & git -C $RepoRoot apply --directory=vendor/xkbcommon-dl $patchFile
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to apply $patchFile to $DestinationPath"
+    }
+
+    $tarball = Join-Path ([System.IO.Path]::GetTempPath()) "libxkbcommon-$($pins.LIBXKBCOMMON_VERSION).tar.gz"
+    try {
+        Invoke-WebRequest -Uri $pins.LIBXKBCOMMON_URL -OutFile $tarball -UseBasicParsing
+        $actualHash = (Get-FileHash -LiteralPath $tarball -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($actualHash -ne $pins.LIBXKBCOMMON_SHA256) {
+            throw "libxkbcommon $($pins.LIBXKBCOMMON_VERSION) checksum mismatch: expected $($pins.LIBXKBCOMMON_SHA256), got $actualHash"
+        }
+
+        $libRoot = Join-Path $DestinationPath 'libxkbcommon'
+        Ensure-Directory -Path $libRoot
+        & (Join-Path $env:SystemRoot 'System32\tar.exe') -xzf $tarball --strip-components=1 -C $libRoot
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to extract $tarball"
+        }
+    } finally {
+        Remove-PathIfPresent -Path $tarball
+    }
+
+    Set-Content -LiteralPath $stampFile -Value $stamp
+}
+
 function Validate-ManifestSources {
     param([Parameter(Mandatory = $true)][string]$ManifestPath)
 
@@ -376,11 +622,14 @@ CONFIG_SHELL = '$ShellExecutable'
 Write-Step 'Hydrating vendor sources'
 Copy-CrateSource -CrateName 'sdl3-sys' -Version '0.6.2+SDL-3.4.4' -DestinationPath $Sdl3SysRoot
 Copy-CrateSource -CrateName 'tikv-jemalloc-sys' -Version '0.6.1' -DestinationPath $JemallocRoot
+Initialize-XkbcommonDlSource -DestinationPath $XkbcommonDlRoot
 
 Write-Step 'Verifying expected vendor layout'
 foreach ($requiredPath in @(
     (Join-Path $Sdl3SysRoot 'Cargo.toml'),
-    (Join-Path $JemallocRoot 'Cargo.toml')
+    (Join-Path $JemallocRoot 'Cargo.toml'),
+    (Join-Path $XkbcommonDlRoot 'build.rs'),
+    (Join-Path $XkbcommonDlRoot 'libxkbcommon\meson.build')
 )) {
     if (-not (Test-Path -LiteralPath $requiredPath)) {
         throw "Expected initialized path missing: $requiredPath"

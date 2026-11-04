@@ -1,0 +1,2 @@
+error: patch location `D:\flutterby Dropbox\Code\flutzPlayer-public\vendor\tikv-jemalloc-sys` does not contain packages matching `tikv-jemalloc-sys`
+help: check `tikv-jemalloc-sys` patch definition for `https://github.com/rust-lang/crates.io-index` in `D:\flutterby Dropbox\Code\flutzPlayer-public\Cargo.toml`

@@ -1,0 +1,26 @@
+# Base runtime libraries, graphics and desktop/audio drivers come from the host.
+ld-linux*
+libc.so*
+libm.so*
+libpthread.so*
+librt.so*
+libdl.so*
+libresolv.so*
+libnss_*
+libEGL*
+libGL*
+libglapi*
+libgbm*
+libdrm*
+libvulkan*
+libX*
+libxcb*
+libwayland*
+libxkbcommon*
+libasound*
+libpulse*
+libpipewire*
+libjack*
+libudev*
+libdecor*
+libSDL3.so*

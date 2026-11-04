@@ -1,0 +1,285 @@
+diff --git a/Cargo.toml b/Cargo.toml
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -37,6 +37,8 @@ version = "1.17"
+ version = "0.2.0"
+ 
+ [features]
++# flutzPlayer: link a vendored static libxkbcommon instead of dlopen.
++static = []
+ x11 = []
+ 
+ [badges]
+diff --git a/build.rs b/build.rs
+new file mode 100644
+--- /dev/null
++++ b/build.rs
+@@ -0,0 +1,114 @@
++use std::env;
++use std::fs;
++use std::path::{Path, PathBuf};
++use std::process::Command;
++
++fn main() {
++    println!("cargo:rerun-if-changed=build.rs");
++    if env::var_os("CARGO_FEATURE_STATIC").is_none() {
++        return;
++    }
++    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux") {
++        panic!("xkbcommon-dl: the `static` feature is only supported on Linux targets");
++    }
++
++    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
++    let source_dir = manifest_dir.join("libxkbcommon");
++    for watched in ["meson.build", "meson_options.txt", "src", "include"] {
++        println!("cargo:rerun-if-changed={}", source_dir.join(watched).display());
++    }
++    println!("cargo:rerun-if-env-changed=PKG_CONFIG_PATH");
++
++    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
++    let build_dir = out_dir.join("libxkbcommon-build");
++    let lib_dir = out_dir.join("lib");
++    let with_x11 = env::var_os("CARGO_FEATURE_X11").is_some();
++
++    if build_dir.exists() {
++        fs::remove_dir_all(&build_dir).expect("failed to clear libxkbcommon build directory");
++    }
++    fs::create_dir_all(&lib_dir).expect("failed to create static library directory");
++
++    // Runtime data lookups (keymaps by RMLVO names, Compose tables) keep using the
++    // distribution-standard locations; X11 and Wayland keymaps come from the server.
++    let mut setup = Command::new("meson");
++    setup
++        .arg("setup")
++        .arg(&build_dir)
++        .arg(&source_dir)
++        .args([
++            "--buildtype=release",
++            "--prefix=/usr",
++            "--sysconfdir=/etc",
++            "--datadir=share",
++            "-Ddefault_library=static",
++            "-Db_staticpic=true",
++            "-Denable-tools=false",
++            "-Denable-docs=false",
++            "-Denable-wayland=false",
++            "-Denable-xkbregistry=false",
++            "-Denable-bash-completion=false",
++            "-Dxkb-config-root=/usr/share/X11/xkb",
++            "-Dxkb-config-extra-path=/etc/xkb",
++            "-Dx-locale-root=/usr/share/X11/locale",
++        ])
++        .arg(format!("-Denable-x11={with_x11}"));
++    run(&mut setup, "meson setup");
++
++    let mut compile = Command::new("meson");
++    compile.arg("compile").arg("-C").arg(&build_dir);
++    if let Ok(jobs) = env::var("NUM_JOBS") {
++        compile.arg("-j").arg(jobs);
++    }
++    compile.arg("xkbcommon");
++    if with_x11 {
++        compile.arg("xkbcommon-x11");
++    }
++    run(&mut compile, "meson compile");
++
++    copy_archive(&build_dir.join("libxkbcommon.a"), &lib_dir);
++    if with_x11 {
++        copy_archive(&build_dir.join("libxkbcommon-x11.a"), &lib_dir);
++        let xcb_libdir = pkg_config_libdir("xcb-xkb");
++        copy_archive(&xcb_libdir.join("libxcb-xkb.a"), &lib_dir);
++    }
++
++    println!("cargo:rustc-link-search=native={}", lib_dir.display());
++    if with_x11 {
++        println!("cargo:rustc-link-lib=static=xkbcommon-x11");
++    }
++    println!("cargo:rustc-link-lib=static=xkbcommon");
++    if with_x11 {
++        println!("cargo:rustc-link-lib=static=xcb-xkb");
++        // Shared with libX11/winit so the X connection object has one owner.
++        println!("cargo:rustc-link-lib=dylib=xcb");
++    }
++}
++
++fn run(command: &mut Command, what: &str) {
++    let status = command
++        .status()
++        .unwrap_or_else(|error| panic!("xkbcommon-dl: failed to run {what}: {error} (is meson installed?)"));
++    if !status.success() {
++        panic!("xkbcommon-dl: {what} failed with {status}");
++    }
++}
++
++fn copy_archive(source: &Path, lib_dir: &Path) {
++    let destination = lib_dir.join(source.file_name().unwrap());
++    fs::copy(source, &destination).unwrap_or_else(|error| {
++        panic!("xkbcommon-dl: failed to copy {}: {error}", source.display())
++    });
++}
++
++fn pkg_config_libdir(package: &str) -> PathBuf {
++    let output = Command::new("pkg-config")
++        .args(["--variable=libdir", package])
++        .output()
++        .unwrap_or_else(|error| panic!("xkbcommon-dl: failed to run pkg-config: {error}"));
++    let libdir = String::from_utf8_lossy(&output.stdout).trim().to_owned();
++    if !output.status.success() || libdir.is_empty() {
++        panic!("xkbcommon-dl: pkg-config could not locate {package}; install its development package");
++    }
++    PathBuf::from(libdir)
++}
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -11,10 +11,42 @@ pub use xkeysym::key as keysyms;
+ use std::os::raw::{c_char, c_int, c_uint, c_void};
+ 
+ use bitflags::bitflags;
++#[cfg(not(feature = "static"))]
+ use dlib::dlopen_external_library;
++#[cfg(not(feature = "static"))]
+ use log::info;
+ use once_cell::sync::OnceCell;
+ 
++// flutzPlayer patch: with the `static` feature, each library struct keeps the same
++// public function-pointer fields but is filled from symbols linked into the binary,
++// so no libxkbcommon*.so is loaded at runtime.
++macro_rules! xkb_external_library {
++    ($structname:ident, functions: $(fn $fname:ident($($farg:ty),*) -> $fret:ty),+ $(,)?) => {
++        #[cfg(not(feature = "static"))]
++        dlopen_external_library!($structname,
++        functions: $(fn $fname($($farg),*) -> $fret),+,
++        );
++
++        #[cfg(feature = "static")]
++        #[allow(improper_ctypes_definitions)]
++        pub struct $structname {
++            $(pub $fname: unsafe extern "C" fn($($farg),*) -> $fret,)+
++        }
++
++        #[cfg(feature = "static")]
++        impl $structname {
++            fn linked() -> Self {
++                // Opaque xkb_* handle types are zero-sized structs only ever used behind pointers.
++                #[allow(improper_ctypes)]
++                extern "C" {
++                    $(fn $fname($(_: $farg),*) -> $fret;)+
++                }
++                Self { $($fname,)+ }
++            }
++        }
++    };
++}
++
+ #[cfg(feature = "x11")]
+ pub mod x11;
+ 
+@@ -157,6 +189,8 @@ pub enum xkb_compose_feed_result {
+ }
+ 
+ bitflags!(
++    // flutzPlayer patch: passed by value across the C ABI, so keep the u32 layout.
++    #[repr(transparent)]
+     pub struct xkb_state_component: u32 {
+         /// Depressed modifiers, i.e. a key is physically holding them.
+         const XKB_STATE_MODS_DEPRESSED = (1 << 0);
+@@ -185,7 +219,7 @@ bitflags!(
+     }
+ );
+ 
+-dlopen_external_library!(XkbCommon,
++xkb_external_library!(XkbCommon,
+ functions:
+     fn xkb_keysym_get_name(xkb_keysym_t, *mut c_char, usize) -> c_int,
+     fn xkb_keysym_from_name(*const c_char, xkb_keysym_flags) -> xkb_keysym_t,
+@@ -281,7 +315,7 @@ functions:
+ );
+ 
+ // Compose and dead-keys support module
+-dlopen_external_library!(XkbCommonCompose,
++xkb_external_library!(XkbCommonCompose,
+ functions:
+     fn xkb_compose_table_new_from_locale(
+         *mut xkb_context,
+@@ -306,6 +340,13 @@ pub fn xkbcommon_handle() -> &'static XkbCommon {
+ }
+ 
+ pub fn xkbcommon_option() -> Option<&'static XkbCommon> {
++    #[cfg(feature = "static")]
++    {
++        static XKBCOMMON_LINKED: OnceCell<XkbCommon> = OnceCell::new();
++        Some(XKBCOMMON_LINKED.get_or_init(XkbCommon::linked))
++    }
++    #[cfg(not(feature = "static"))]
++    {
+     static XKBCOMMON_OPTION: OnceCell<Option<XkbCommon>> = OnceCell::new();
+     XKBCOMMON_OPTION
+         .get_or_init(|| {
+@@ -316,6 +357,7 @@ pub fn xkbcommon_option() -> Option<&'static XkbCommon> {
+             )
+         })
+         .as_ref()
++    }
+ }
+ 
+ pub fn xkbcommon_compose_handle() -> &'static XkbCommonCompose {
+@@ -323,6 +365,13 @@ pub fn xkbcommon_compose_handle() -> &'static XkbCommonCompose {
+ }
+ 
+ pub fn xkbcommon_compose_option() -> Option<&'static XkbCommonCompose> {
++    #[cfg(feature = "static")]
++    {
++        static XKBCOMMON_COMPOSE_LINKED: OnceCell<XkbCommonCompose> = OnceCell::new();
++        Some(XKBCOMMON_COMPOSE_LINKED.get_or_init(XkbCommonCompose::linked))
++    }
++    #[cfg(not(feature = "static"))]
++    {
+     static XKBCOMMON_COMPOSE_OPTION: OnceCell<Option<XkbCommonCompose>> = OnceCell::new();
+     XKBCOMMON_COMPOSE_OPTION
+         .get_or_init(|| {
+@@ -333,8 +382,10 @@ pub fn xkbcommon_compose_option() -> Option<&'static XkbCommonCompose> {
+             )
+         })
+         .as_ref()
++    }
+ }
+ 
++#[cfg(not(feature = "static"))]
+ fn open_with_sonames<T, F>(names: &[&str], module: Option<&str>, open: F) -> Option<T>
+ where
+     F: Fn(&str) -> Result<T, dlib::DlError>,
+diff --git a/src/x11.rs b/src/x11.rs
+--- a/src/x11.rs
++++ b/src/x11.rs
+@@ -16,7 +16,7 @@ pub enum xkb_x11_setup_xkb_extension_flags {
+     XKB_X11_SETUP_XKB_EXTENSION_NO_FLAGS = 0,
+ }
+ 
+-dlopen_external_library!(XkbCommonX11,
++xkb_external_library!(XkbCommonX11,
+ functions:
+     fn xkb_x11_setup_xkb_extension(
+         *mut xcb_connection_t,
+@@ -43,6 +43,13 @@ functions:
+ );
+ 
+ pub fn xkbcommon_x11_option() -> Option<&'static XkbCommonX11> {
++    #[cfg(feature = "static")]
++    {
++        static XKBCOMMON_X11_LINKED: OnceCell<XkbCommonX11> = OnceCell::new();
++        Some(XKBCOMMON_X11_LINKED.get_or_init(XkbCommonX11::linked))
++    }
++    #[cfg(not(feature = "static"))]
++    {
+     static XKBCOMMON_X11_OPTION: OnceCell<Option<XkbCommonX11>> = OnceCell::new();
+     XKBCOMMON_X11_OPTION
+         .get_or_init(|| {
+@@ -53,6 +60,7 @@ pub fn xkbcommon_x11_option() -> Option<&'static XkbCommonX11> {
+             )
+         })
+         .as_ref()
++    }
+ }
+ 
+ pub fn xkbcommon_x11_handle() -> &'static XkbCommonX11 {

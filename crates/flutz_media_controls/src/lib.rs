@@ -6,13 +6,16 @@ mod noop;
 #[cfg(windows)]
 mod windows;
 
-use std::{path::PathBuf, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 pub use noop::NoopMediaControlsBackend;
 
 pub const MEDIA_CONTROLS_TIMELINE_PUBLISH_INTERVAL_MS: u64 = 1_000;
 pub const MEDIA_CONTROLS_TIMELINE_PUBLISH_INTERVAL: Duration =
     Duration::from_millis(MEDIA_CONTROLS_TIMELINE_PUBLISH_INTERVAL_MS);
+
+/// Called from the thread that queued a command so the host can poll promptly.
+pub type MediaCommandWaker = Arc<dyn Fn() + Send + Sync>;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum MediaControlCommand {
@@ -119,6 +122,8 @@ pub trait MediaControlsBackend {
     fn poll_command(&mut self) -> Option<MediaControlCommand>;
     fn publish_snapshot(&mut self, snapshot: &MediaTrackSnapshot);
     fn shutdown(&mut self);
+    /// Backends that receive commands asynchronously call `waker` after queueing one.
+    fn set_command_waker(&mut self, _waker: MediaCommandWaker) {}
 }
 
 pub fn create_media_controls_backend() -> Box<dyn MediaControlsBackend> {

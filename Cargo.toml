@@ -7,6 +7,7 @@ members = [
     "crates/flutz_dat",
     "crates/flutz_fmid",
     "crates/flutz_formats",
+    "crates/flutz_fs_sdl3",
     "crates/flutz_format_aac",
     "crates/flutz_format_flac",
     "crates/flutz_format_mp3",
@@ -22,7 +23,11 @@ members = [
     "crates/flutz_visualizer_egui",
 ]
 resolver = "2"
-exclude = ["vendor/tikv-jemalloc-sys"]
+exclude = [
+    "vendor/xkbcommon-dl",
+    "vendor/SDL3/sdl3-sys-0.6.2+SDL-3.4.4-spacefix",
+    "vendor/tikv-jemalloc-sys",
+]
 
 [workspace.package]
 edition = "2021"
@@ -32,6 +37,7 @@ unsafe_code = "warn"
 
 [patch.crates-io]
 tikv-jemalloc-sys = { path = "vendor/tikv-jemalloc-sys" }
+xkbcommon-dl = { path = "vendor/xkbcommon-dl" }
 
 [profile.dev.package.flutz_audio_sdl3]
 opt-level = 2

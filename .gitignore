@@ -1,4 +1,5 @@
 _local
+.vagrant
 .cargo
 vendor
 Cargo.lock

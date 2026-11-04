@@ -322,7 +322,7 @@ fn render_direct(
 ) -> Vec<f32> {
     let synthesizer = Synthesizer::new(soundfont, settings).expect("synthesizer should create");
     let mut sequencer = MidiFileSequencer::new(synthesizer);
-    sequencer.play(midi, false);
+    sequencer.play(midi);
     let mut left = vec![0.0; frames];
     let mut right = vec![0.0; frames];
     sequencer.render(&mut left, &mut right);
@@ -338,7 +338,7 @@ fn render_channel_program_stems(
 ) -> Vec<StemRenderBlock> {
     let synthesizer = Synthesizer::new(soundfont, settings).expect("synthesizer should create");
     let mut sequencer = MidiFileSequencer::new(synthesizer);
-    sequencer.play(midi, false);
+    sequencer.play(midi);
     let request = StemRenderRequest::channel_program(soundfont_id);
     sequencer.render_stems(&request, frames).blocks
 }

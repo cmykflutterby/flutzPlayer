@@ -2,7 +2,7 @@
 
 ![flutzPlayer GUI](docs/flutzPlayer-screen-1.png)
 
-flutzPlayer is a desktop music player and mastering tool for audiophiles who want more features and better fidelity from their audio formats. flutzPlayer accomplishes this by adding a complex mixer and mastering stage to the rendering pipeline which users can tune to their specific needs. These mastered versions can be saved in a flutz wrapper format so that settings persist across playback.
+flutzPlayer is a desktop music player and mastering tool for audiophiles who want more features and better fidelity from their audio formats. flutzPlayer accomplishes this by adding a complex mixer and mastering stage to the rendering pipeline which users can tune to their specific needs. These mastered versions can be saved in a flutz wrapper formats so that settings persist across playback.
 
 For example, MIDI files can be mastered and saved as FMidi files, combining:
 - Per-track, configurable layered SoundFonts (multiple, simultaneous fonts, blended, your way)
@@ -20,19 +20,16 @@ This allows enriched playback of MIDI files to produce the best sound to match t
 Encoded Audio format support! Remaster your audio files by saving in a flutz format, enabling track-level Parametric EQ/Mastering or simply set default equalizer settings to best fit your speakers or preferences.
 
 **Quick Notes:**
- - This should compile and work on all OS, but has only been tested in Windows
+ - Linux version should work correctly in both X11 and full Wayland environments
  - Memory and CPU loads have only basic Optimization; Runs very well for me using only 67MB of memory (YMMV)
  - UI is intentionally simple, CTRL+/CTRL- are your friend
- - Project needs a better UI
- - this project's main goal is to exercise the sound engine of the flutzBox emulator 
- - this build-init script will configure build artifacts so builds work and assumes MSYS/GNU Toolchain
- - i'm not an audio engineer
+ - I'm not an audio engineer, so feel free to submit any improvements which affect accuracy and quality
 
 ## Download, Install, and Use
 
 1. Download the latest flutzPlayer release package
 2. Extract it anywhere (portable layout)
-3. Run flutzplayer.exe
+3. Run flutzplayer.exe (or flutzPlayer.AppImage for linux)
 
 
 ## Music Format Support Matrix
@@ -47,94 +44,6 @@ Encoded Audio format support! Remaster your audio files by saving in a flutz for
 | Ogg Vorbis / Opus | .fogg / .fopus | Supported | |
 | WAV / AIFF | .fwav / .faiff | Supported | |
 | AAC in MP4/M4A | .fm4a / .fmp4 | Supported | |
-
-## Developer Build Guide
-
-### Windows MSYS prerequisites
-
-The Windows build uses a POSIX shell and GNU userland tools for the vendored `tikv-jemalloc-sys` configure/make step. Install MSYS2 and the MinGW64 toolchain before running `build-init.ps1`.
-
-Recommended MSYS2 packages:
-
-```powershell
-pacman -S --needed base-devel mingw-w64-x86_64-toolchain
-```
-
-That gives you the tools this build expects, including `sh`, `bash`, `sed`, `grep`, `expr`, `gawk`, `make`, `ar`, `nm`, and `install`.
-
-Make sure one of these shell locations is available so the bootstrap script can discover it automatically:
-
-- `C:\msys64\usr\bin\sh.exe`
-- `C:\Program Files\Git\bin\sh.exe`
-- `C:\Program Files\Git\usr\bin\sh.exe`
-
-If MSYS2 is installed somewhere else, set `MSYS2_ROOT` to the MSYS2 install root before running the bootstrap script. The build also uses the same shell path for `CONFIG_SHELL`, `SHELL`, and `MAKESHELL` during jemalloc configuration.
-
-## Design Philosophy
-
-- Code and data structures must be future-proof
-- Don't interrupt the user
-- Errors should not create stoppages
-- No application or format version numbering
-
-## Clone and bootstrap
-
-If you are setting up the Windows development environment for the first time, install the MSYS2 packages above first, then continue here.
-
-```powershell
-git clone https://github.com/cmykflutterby/flutzPlayer.git
-cd flutzPlayer
-.\build-init.ps1
-```
-
-This prepares the local dev layout, vendors the required external crate sources, and stages the workspace so the regular build scripts can run without manual setup.
-
-To return the checkout to a pre-initialized state, run:
-
-```powershell
-.\build-init.ps1 -Clean
-```
-
-## First build/validation flow
-
-```powershell
-cargo check -p flutzplayer
-.\build.ps1 -Configuration Debug -BuildDat
-```
-
-Run from source:
-
-```powershell
-cargo run -p flutzplayer -- --gui --data-dir drops/flutzplayer/data
-```
-
-Run packaged drop:
-
-```powershell
-.\drops\flutzplayer\flutzplayer-debug.exe --gui --data-dir .\drops\flutzplayer\data
-```
-Build DAT fileset:
-
-```powershell
-.\build-dat.ps1
-```
-
-Create build:
-
-```powershell
-.\build.ps1 -Configuration Release
-```
-
-Create build with fresh DATs:
-
-```powershell
-.\build.ps1 -Configuration Release -BuildDat
-```
-
-**NOTES:**
-
-- [build.ps1](build.ps1): workspace build + drop staging
-- [build-dat.ps1](build-dat.ps1): DAT generation from [assets/dat-manifest.toml](assets/dat-manifest.toml)
 
 ## Bundled SoundFonts 
 
@@ -176,11 +85,13 @@ DAT files are loaded together to allow an easy and quick method for granular loa
 | flutz_dat | DAT archive read/write and pack logic | Multi-threaded instrument loading and DAT packaging |
 | flutz_fmid | FMID format implementation | MIDI wrapper/project container persistence |
 | flutz_formats | Common playable format registry and wrapper records | Symphonia-backed decode, metadata, and wrapper handling |
+| flutz_fs_sdl3 | SDL3-backed filesystem helpers | Directory creation, writability checks, and atomic file writes via SDL3 I/O |
 | flutz_format_aac | AAC/MP4 backend registration | Symphonia decode probe support for AAC/MP4 |
 | flutz_format_flac | FLAC backend registration | Symphonia decode probe support for FLAC |
 | flutz_format_mp3 | MP3 backend registration | Symphonia decode probe support for MP3 |
 | flutz_format_ogg | Ogg Vorbis/Opus backend registration | Symphonia decode probe support for Ogg Vorbis and Opus |
 | flutz_format_pcm | WAV/AIFF PCM backend registration | Symphonia decode probe support for PCM containers |
+| flutz_media_controls | OS media transport integration | Windows SMTC, jump list, and media-command relay; no-op backend on Linux/macOS |
 | flutz_mixer | Mixer DSP/control primitives | Shared mixer, EQ, limiter, and routing primitives |
 | flutz_peq | Streaming parametric EQ primitives | Decoded-audio mastering presets and runtime PEQ |
 | flutz_soundfont_tools | SoundFont tooling/conversion utilities | sf2/sf2Ark conversions, analysis, and SoundFont pipeline helpers |
