@@ -5,3 +5,4 @@
 /build/linux/appimage/*.txt text eol=lf
 /build/linux/appimage/AppRun text eol=lf
 /build/vendor-patches/** -text
+/gh/*.sh text eol=lf

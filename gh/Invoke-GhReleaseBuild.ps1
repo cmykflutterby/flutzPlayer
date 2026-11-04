@@ -1,6 +1,8 @@
 param(
     [ValidateSet("Debug", "Release")]
-    [string]$Configuration = "Release"
+    [string]$Configuration = "Release",
+    # Stage binaries and DAT tooling only; DATs are packed separately by the release workflow.
+    [switch]$NoDat
 )
 
 Set-StrictMode -Version Latest
@@ -79,10 +81,12 @@ try {
         throw "Prepare-GhVendor.ps1 failed with exit code $LASTEXITCODE"
     }
 
-    Write-Host "Ensuring required soundfonts are present"
-    & $GhSoundfontScript -DestinationDirectory (Join-Path $RepoRoot "soundfonts")
-    if ($LASTEXITCODE -ne 0) {
-        throw "Get-GhSoundfonts.ps1 failed with exit code $LASTEXITCODE"
+    if (-not $NoDat) {
+        Write-Host "Ensuring required soundfonts are present"
+        & $GhSoundfontScript -DestinationDirectory (Join-Path $RepoRoot "soundfonts")
+        if ($LASTEXITCODE -ne 0) {
+            throw "Get-GhSoundfonts.ps1 failed with exit code $LASTEXITCODE"
+        }
     }
 
 
@@ -124,10 +128,12 @@ try {
     Copy-Item -Force -LiteralPath $DatManifest -Destination (Join-Path $DropDatPacker "dat-manifest.toml")
 
 
-    Write-Host "Packing and caching DAT assets"
-    & $PackageDatScript -Configuration $Configuration -OutputDirectory $DropData
-    if ($LASTEXITCODE -ne 0) {
-        throw "Package-GhDatAssets.ps1 failed with exit code $LASTEXITCODE"
+    if (-not $NoDat) {
+        Write-Host "Packing and caching DAT assets"
+        & $PackageDatScript -Configuration $Configuration -OutputDirectory $DropData
+        if ($LASTEXITCODE -ne 0) {
+            throw "Package-GhDatAssets.ps1 failed with exit code $LASTEXITCODE"
+        }
     }
     $stagedSdlDlls = @(Get-ChildItem -Path $DropRoot -Filter "SDL3.dll" -File -Recurse -ErrorAction SilentlyContinue)
     if ($stagedSdlDlls.Count -gt 0) {

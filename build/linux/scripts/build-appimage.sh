@@ -9,6 +9,7 @@ fail() {
 usage() {
     echo 'Usage: build-appimage.sh record BINARY SNAPSHOT RECORD ALLOCATOR' >&2
     echo '       build-appimage.sh build BINARY SNAPSHOT RECORD OUTPUT_DIRECTORY ALLOCATOR' >&2
+    echo '       build-appimage.sh ci BINARY OUTPUT_DIRECTORY ALLOCATOR SOURCE_REVISION' >&2
     exit 2
 }
 
@@ -18,22 +19,39 @@ shift
 case "$mode" in
     record) [[ $# -eq 4 ]] || usage ;;
     build) [[ $# -eq 5 ]] || usage ;;
+    ci) [[ $# -eq 4 ]] || usage ;;
     *) usage ;;
 esac
 binary=$1
-snapshot=$2
-record=$3
-if [[ $mode == build ]]; then
-    output_directory=$4
-    allocator=$5
+snapshot=
+record=
+source_revision=
+if [[ $mode == ci ]]; then
+    # GitHub Actions: an ubuntu:26.04 container builds a git checkout, so the
+    # commit replaces the VM's synchronized-snapshot provenance.
+    output_directory=$2
+    allocator=$3
+    source_revision=$4
+    [[ $source_revision =~ ^[0-9a-f]{40}$ ]] || fail "invalid source revision: $source_revision"
 else
-    allocator=$4
+    snapshot=$2
+    record=$3
+    if [[ $mode == build ]]; then
+        output_directory=$4
+        allocator=$5
+    else
+        allocator=$4
+    fi
 fi
 [[ $allocator == jemalloc || $allocator == system ]] || fail "invalid allocator: $allocator"
-[[ $binary == /* && $snapshot == /* && $record == /* ]] ||
-    fail 'binary, snapshot, and record paths must be absolute'
+if [[ $mode == ci ]]; then
+    [[ $binary == /* ]] || fail 'binary path must be absolute'
+else
+    [[ $binary == /* && $snapshot == /* && $record == /* ]] ||
+        fail 'binary, snapshot, and record paths must be absolute'
+fi
 [[ -f $binary && -x $binary ]] || fail "missing or non-executable release binary: $binary"
-[[ -f $snapshot ]] || fail "missing source snapshot: $snapshot; synchronize the source first"
+[[ $mode == ci || -f $snapshot ]] || fail "missing source snapshot: $snapshot; synchronize the source first"
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 source_root=$(cd -- "$script_dir/../../.." && pwd -P)
@@ -46,17 +64,27 @@ export PATH="$HOME/.cargo/bin:$PATH"
 unset LD_PRELOAD LD_LIBRARY_PATH
 
 . /etc/os-release
-[[ $ID == ubuntu && $VERSION_ID == 26.04 && $(uname -m) == x86_64 ]] &&
-    grep -Fq '26.04.1' /var/log/installer/media-info ||
-    fail 'Ubuntu 26.04.1 x86_64 is required'
-snapshot_root=$(jq -er '.sourceRoot' "$snapshot")
-[[ $(realpath -e -- "$snapshot_root") == "$source_root" ]] ||
-    fail 'source snapshot belongs to a different source tree'
-snapshot_sha=$(jq -er '
-    select(.schemaId == "https://flutzplayer.local/schemas/source-snapshot/v1") |
-    .aggregateSha256
-' "$snapshot")
-[[ $snapshot_sha =~ ^[0-9a-f]{64}$ ]] || fail 'invalid source snapshot hash'
+if [[ $mode == ci ]]; then
+    # Container images have no installer media record; the release matches
+    # the VM's Ubuntu 26.04 baseline.
+    [[ $ID == ubuntu && $VERSION_ID == 26.04 && $(uname -m) == x86_64 ]] ||
+        fail 'Ubuntu 26.04 x86_64 is required'
+    media=container
+    snapshot_sha=
+else
+    [[ $ID == ubuntu && $VERSION_ID == 26.04 && $(uname -m) == x86_64 ]] &&
+        grep -Fq '26.04.1' /var/log/installer/media-info ||
+        fail 'Ubuntu 26.04.1 x86_64 is required'
+    media=26.04.1
+    snapshot_root=$(jq -er '.sourceRoot' "$snapshot")
+    [[ $(realpath -e -- "$snapshot_root") == "$source_root" ]] ||
+        fail 'source snapshot belongs to a different source tree'
+    snapshot_sha=$(jq -er '
+        select(.schemaId == "https://flutzplayer.local/schemas/source-snapshot/v1") |
+        .aggregateSha256
+    ' "$snapshot")
+    [[ $snapshot_sha =~ ^[0-9a-f]{64}$ ]] || fail 'invalid source snapshot hash'
+fi
 binary_sha=$(sha256sum < "$binary" | cut -d ' ' -f 1)
 lock_sha=$(sha256sum < "$source_root/Cargo.lock" | cut -d ' ' -f 1)
 rustc_version=$(rustc --version)
@@ -83,18 +111,20 @@ if [[ $mode == record ]]; then
 fi
 
 [[ $output_directory == /* && $output_directory != / ]] || fail 'output directory must be absolute'
-[[ -f $record ]] || fail 'release build provenance is missing; build without -SkipBuild first'
-jq -e \
-    --arg snapshot "$snapshot_sha" \
-    --arg binary "$binary_sha" \
-    --arg lock "$lock_sha" \
-    --arg rustc "$rustc_version" \
-    --arg allocator "$allocator" \
-    '.schemaId == "https://flutzplayer.local/schemas/appimage-build-record/v1" and
-     .sourceSnapshotSha256 == $snapshot and .binarySha256 == $binary and
-     .cargoLockSha256 == $lock and .rustc == $rustc and .allocator == $allocator' \
-    "$record" >/dev/null ||
-    fail 'release binary provenance does not match the synchronized source, toolchain, or allocator; build without -SkipBuild'
+if [[ $mode == build ]]; then
+    [[ -f $record ]] || fail 'release build provenance is missing; build without -SkipBuild first'
+    jq -e \
+        --arg snapshot "$snapshot_sha" \
+        --arg binary "$binary_sha" \
+        --arg lock "$lock_sha" \
+        --arg rustc "$rustc_version" \
+        --arg allocator "$allocator" \
+        '.schemaId == "https://flutzplayer.local/schemas/appimage-build-record/v1" and
+         .sourceSnapshotSha256 == $snapshot and .binarySha256 == $binary and
+         .cargoLockSha256 == $lock and .rustc == $rustc and .allocator == $allocator' \
+        "$record" >/dev/null ||
+        fail 'release binary provenance does not match the synchronized source, toolchain, or allocator; build without -SkipBuild'
+fi
 
 for path in "$versions" "$desktop" "$icon" "$apprun" "$library_policy"; do
     [[ -f $path && -r $path ]] || fail "missing packaging resource: $path"
@@ -114,11 +144,13 @@ mkdir -- "$work"
 trap 'rm -rf -- "$work"' EXIT
 export TMPDIR="$work/tmp"
 mkdir -- "$TMPDIR"
-bash "$source_root/build/linux/sync/write-source-snapshot.sh" \
-    "$source_root" "$work/current-snapshot.json" > "$work/source-snapshot.log"
-current_snapshot_sha=$(jq -er '.aggregateSha256' "$work/current-snapshot.json")
-[[ $current_snapshot_sha == "$snapshot_sha" ]] ||
-    fail 'guest source changed after synchronization; synchronize and rebuild'
+if [[ $mode == build ]]; then
+    bash "$source_root/build/linux/sync/write-source-snapshot.sh" \
+        "$source_root" "$work/current-snapshot.json" > "$work/source-snapshot.log"
+    current_snapshot_sha=$(jq -er '.aggregateSha256' "$work/current-snapshot.json")
+    [[ $current_snapshot_sha == "$snapshot_sha" ]] ||
+        fail 'guest source changed after synchronization; synchronize and rebuild'
+fi
 
 for tool in linuxdeploy appimagetool; do
     asset=$(jq -er ".$tool.asset" "$versions")
@@ -249,13 +281,14 @@ jq -n \
     --arg osId "$ID" \
     --arg osVersion "$VERSION_ID" \
     --arg osName "$PRETTY_NAME" \
-    --arg media '26.04.1' \
+    --arg media "$media" \
     --arg arch "$(uname -m)" \
     --arg kernel "$(uname -r)" \
     --arg rustc "$rustc_version" \
     --arg cargo "$cargo_version" \
     --arg lock "$lock_sha" \
     --arg snapshot "$snapshot_sha" \
+    --arg revision "$source_revision" \
     --arg binary "$binary_sha" \
     --arg allocator "$allocator" \
     --arg image "$image_sha" \
@@ -267,8 +300,10 @@ jq -n \
         createdAtUtc: $createdAtUtc,
         guest: {id: $osId, version: $osVersion, name: $osName, media: $media, architecture: $arch, kernel: $kernel},
         tools: {linuxdeploy: $linuxdeploy, appimagetool: $appimagetool, runtime: $runtime},
-        build: {rustc: $rustc, cargo: $cargo, cargoLockSha256: $lock,
-                sourceSnapshotSha256: $snapshot, binarySha256: $binary, allocator: $allocator},
+        build: ({rustc: $rustc, cargo: $cargo, cargoLockSha256: $lock,
+                sourceSnapshotSha256: (if $snapshot == "" then null else $snapshot end),
+                binarySha256: $binary, allocator: $allocator} +
+                (if $revision == "" then {} else {sourceRevision: $revision} end)),
         appimage: {name: "flutzPlayer-x86_64.AppImage", sha256: $image}
     }' > "$metadata"
 metadata_sha=$(sha256sum < "$metadata" | cut -d ' ' -f 1)

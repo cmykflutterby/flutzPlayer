@@ -1,17 +1,26 @@
 name: Release Build
 
+# Manual only. Runs on main create a complete *draft* release that must be
+# published by hand; runs on any other branch are build-only and create no
+# release or tag.
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
+    inputs:
+      rebuild_dat:
+        description: Ignore the DAT cache and repack the DAT fileset
+        type: boolean
+        default: false
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-build-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  release-windows:
-    name: Build Windows Release
+  windows-build:
+    name: Build Windows Binaries
     runs-on: windows-latest
     timeout-minutes: 120
 
@@ -32,6 +41,11 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable-x86_64-pc-windows-gnu
+
+      - name: Restore Rust Build Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-gnu
 
       - name: Export MSYS2 Tool Paths
         shell: pwsh
@@ -105,21 +119,7 @@ jobs:
         shell: pwsh
         run: ./gh/Prepare-GhVendor.ps1
 
-      - name: Restore Soundfont Cache
-        uses: actions/cache@v4
-        with:
-          path: soundfonts
-          key: flutz-windows-soundfonts-v1-${{ hashFiles('gh/Get-GhSoundfonts.ps1') }}
-
-      - name: Restore DAT Cache
-        uses: actions/cache@v4
-        with:
-          path: .gh-cache/dat-packs
-          key: flutz-windows-dat-v1-${{ hashFiles('assets/dat-manifest.toml', 'soundfonts/*.sf2') }}
-          restore-keys: |
-            flutz-windows-dat-v1-
-
-      - name: Build Release Drop
+      - name: Build Windows Drop (no DAT)
         shell: pwsh
         env:
           CMAKE_ARGS: >-
@@ -127,35 +127,269 @@ jobs:
             -DSDL_OPENGLES=OFF
             -DSDL_RENDER_GPU=OFF
             -DSDL_RENDER_VULKAN=OFF
-        run: ./gh/Invoke-GhReleaseBuild.ps1 -Configuration Release
+        run: ./gh/Invoke-GhReleaseBuild.ps1 -Configuration Release -NoDat
 
-      - name: Generate Release Name
-        id: release_name
-        shell: pwsh
-        run: |
-          $stamp = Get-Date -AsUTC -Format 'yyMMddHHmmss'
-          $archiveName = "flutzPlayer-Windows-x64-$stamp.zip"
-          "stamp=$stamp" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-          "archive_name=$archiveName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-          Add-Content -LiteralPath $env:GITHUB_ENV -Value "FLUTZ_RELEASE_STAMP=$stamp"
-          Add-Content -LiteralPath $env:GITHUB_ENV -Value "FLUTZ_RELEASE_ARCHIVE_NAME=$archiveName"
-          Write-Host "Release archive name: $archiveName"
-
-      - name: Package Release Zip
-        shell: pwsh
-        run: ./gh/Package-GhRelease.ps1 -OutputDirectory artifacts -ArchiveName $env:FLUTZ_RELEASE_ARCHIVE_NAME
-
-      - name: Upload Workflow Artifact
+      - name: Upload Windows Drop
         uses: actions/upload-artifact@v4
         with:
-          name: flutzplayer-windows-x64
-          path: artifacts/${{ steps.release_name.outputs.archive_name }}
+          name: windows-drop
+          path: drops/flutzplayer
           if-no-files-found: error
+          retention-days: 1
 
-      - name: Publish GitHub Release Asset
-        if: github.ref == 'refs/heads/main'
-        uses: softprops/action-gh-release@v2
+  linux-build:
+    name: Build Linux Binaries and AppImage
+    runs-on: ubuntu-latest
+    # Matches the Ubuntu 26.04 baseline of the local VirtualBox build VM.
+    container: ubuntu:26.04
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    env:
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - name: Install Build Prerequisites
+        # Build-relevant subset of build/linux/provision/provision.sh.
+        run: |
+          apt-get update
+          apt-get install -y \
+            build-essential clang lld cmake ninja-build meson bison patch make pkg-config \
+            autoconf automake libtool libtool-bin git curl ca-certificates wget \
+            jq file patchelf zip unzip tar xz-utils zstd gzip bzip2 coreutils \
+            desktop-file-utils shared-mime-info squashfs-tools \
+            libsdl3-dev \
+            libasound2-dev libpulse-dev libpipewire-0.3-dev libjack-jackd2-dev \
+            libdbus-1-dev libudev-dev \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxfixes-dev \
+            libxi-dev libxss-dev libxtst-dev libxkbcommon-dev \
+            libwayland-dev libdecor-0-dev \
+            libdrm-dev libgbm-dev libgl1-mesa-dev libegl-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxcb-xkb-dev \
+            libgtk-3-dev libssl-dev
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read Pinned Rust Toolchain
+        id: pins
+        run: echo "rust=$(jq -er '.rust.toolchain' build/linux/tool-versions.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
         with:
-          tag_name: main-${{ steps.release_name.outputs.stamp }}
-          name: flutzPlayer Windows x64 ${{ steps.release_name.outputs.stamp }}
-          files: artifacts/${{ steps.release_name.outputs.archive_name }}
+          toolchain: ${{ steps.pins.outputs.rust }}
+
+      # The cache root must sit outside the workspace: hydration creates a
+      # standalone Cargo package there.
+      - name: Restore Rust Build Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ubuntu-26.04
+          workspaces: ". -> ../flutz-linux-cache/target"
+
+      - name: Hydrate Vendored Sources
+        run: bash build/linux/sync/hydrate-linux-source.sh "$GITHUB_WORKSPACE" "$(dirname "$GITHUB_WORKSPACE")/flutz-linux-cache"
+
+      - name: Build Linux Binaries
+        run: cargo build --workspace --release --features flutzplayer/jemalloc-memory
+
+      - name: Verify Linux Binaries
+        run: |
+          target_dir=$(cargo metadata --no-deps --format-version 1 | jq -er .target_directory)
+          echo "FLUTZ_TARGET_DIR=$target_dir" >> "$GITHUB_ENV"
+          bash gh/verify-linux-binaries.sh "$target_dir/release/flutzplayer" "$target_dir/release/flutz_soundfont_tools"
+
+      - name: Install Pinned AppImage Tools
+        run: |
+          versions=build/linux/tool-versions.json
+          install -d -m 0755 /opt/flutzplayer-tools
+          for tool in linuxdeploy appimagetool; do
+            url=$(jq -er ".$tool.url" "$versions")
+            sha256=$(jq -er ".$tool.sha256" "$versions")
+            asset=$(jq -er ".$tool.asset" "$versions")
+            curl --fail --location --silent --show-error --output "/opt/flutzplayer-tools/$asset" "$url"
+            printf '%s  %s\n' "$sha256" "/opt/flutzplayer-tools/$asset" | sha256sum --check --strict
+            chmod 0755 "/opt/flutzplayer-tools/$asset"
+          done
+
+      - name: Build AppImage
+        run: |
+          bash build/linux/scripts/build-appimage.sh ci \
+            "$FLUTZ_TARGET_DIR/release/flutzplayer" "$RUNNER_TEMP/appimage" jemalloc "$GITHUB_SHA"
+
+      - name: Stage Linux Build
+        # Tar preserves executable bits, which workflow artifacts drop.
+        run: |
+          stage="$RUNNER_TEMP/linux-build"
+          install -d "$stage" "$GITHUB_WORKSPACE/_local"
+          install -m 0755 "$FLUTZ_TARGET_DIR/release/flutzplayer" "$stage/flutzplayer"
+          install -m 0755 "$FLUTZ_TARGET_DIR/release/flutz_soundfont_tools" "$stage/dat-packer"
+          install -m 0755 "$RUNNER_TEMP/appimage/flutzPlayer-x86_64.AppImage" "$stage/flutzPlayer-x86_64.AppImage"
+          install -m 0644 "$RUNNER_TEMP/appimage/metadata.json" "$stage/metadata.json"
+          tar -cf "$GITHUB_WORKSPACE/_local/linux-build.tar" -C "$stage" .
+
+      - name: Upload Linux Build
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-build
+          # Workspace-relative: runner.temp is not translated inside containers.
+          path: _local/linux-build.tar
+          if-no-files-found: error
+          retention-days: 1
+
+  dat-build:
+    name: Build DAT Fileset
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compute DAT Cache Key
+        id: dat-key
+        # Inputs that determine DAT content: manifest, soundfont source, and the packer's crates.
+        run: |
+          echo "key=flutz-dat-v2-${{ hashFiles('assets/dat-manifest.toml', 'gh/Get-GhSoundfonts.ps1', 'build/linux/scripts/build-dat.sh', 'build/linux/scripts/pack-dat.sh', 'crates/flutz_dat/**', 'crates/flutz_soundfont_tools/**', 'crates/flutz_core/**', 'crates/flutz_fmid/**', 'crates/flutz_synth/**', 'crates/rustystem/**') }}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore DAT Cache
+        id: dat-cache
+        if: ${{ !inputs.rebuild_dat }}
+        uses: actions/cache/restore@v4
+        with:
+          path: _local/release-dat
+          key: ${{ steps.dat-key.outputs.key }}
+
+      - name: Restore Soundfont Cache
+        if: steps.dat-cache.outputs.cache-hit != 'true'
+        uses: actions/cache@v4
+        with:
+          path: soundfonts/*.sf2
+          key: flutz-soundfonts-v2-${{ hashFiles('gh/Get-GhSoundfonts.ps1') }}
+
+      - name: Download Soundfonts
+        if: steps.dat-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: ./gh/Get-GhSoundfonts.ps1 -DestinationDirectory soundfonts
+
+      - name: Pack DAT Fileset
+        if: steps.dat-cache.outputs.cache-hit != 'true'
+        run: |
+          bash build/linux/sync/hydrate-linux-source.sh "$GITHUB_WORKSPACE" "$RUNNER_TEMP/flutz-dat-cache"
+          rm -rf _local/release-dat
+          bash build/linux/scripts/build-dat.sh "$GITHUB_WORKSPACE/_local/release-dat"
+          cd _local/release-dat
+          sha256sum -- assets-*.dat > SHA256SUMS
+
+      - name: Save DAT Cache
+        if: steps.dat-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: _local/release-dat
+          key: ${{ steps.dat-key.outputs.key }}
+
+      - name: Verify DAT Fileset
+        working-directory: _local/release-dat
+        run: |
+          shopt -s nullglob
+          parts=(assets-*.dat)
+          ((${#parts[@]} > 0)) || { echo 'No DAT parts were produced' >&2; exit 1; }
+          for index in "${!parts[@]}"; do
+            printf -v expected 'assets-%03d.dat' "$index"
+            [[ ${parts[index]} == "$expected" ]] || { echo "Unexpected DAT part: ${parts[index]}" >&2; exit 1; }
+          done
+          [[ $(find . -mindepth 1 | wc -l) -eq $((${#parts[@]} + 1)) ]] || { echo 'Unexpected files in DAT fileset' >&2; exit 1; }
+          sha256sum --check --strict SHA256SUMS
+
+      - name: Upload DAT Fileset
+        uses: actions/upload-artifact@v4
+        with:
+          name: dat-fileset
+          path: _local/release-dat
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  assemble:
+    name: Assemble Release Archives
+    needs: [windows-build, linux-build, dat-build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download Windows Drop
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-drop
+          path: ${{ runner.temp }}/in/windows
+
+      - name: Download Linux Build
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-build
+          path: ${{ runner.temp }}/in
+
+      - name: Download DAT Fileset
+        uses: actions/download-artifact@v4
+        with:
+          name: dat-fileset
+          path: ${{ runner.temp }}/in/dat
+
+      - name: Package Release Archives
+        id: package
+        run: |
+          in="$RUNNER_TEMP/in"
+          mkdir "$in/linux"
+          tar -xf "$in/linux-build.tar" -C "$in/linux"
+          stamp=$(date -u +%y%m%d%H%M%S)
+          echo "stamp=$stamp" >> "$GITHUB_OUTPUT"
+          bash gh/package-release.sh "$stamp" "$GITHUB_SHA" \
+            "$in/windows" "$in/linux" "$in/dat" "$RUNNER_TEMP/release" "$RUNNER_TEMP/SHA256SUMS.txt"
+
+      - name: Upload Build-Only Archives
+        if: github.ref != 'refs/heads/main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-archives-${{ steps.package.outputs.stamp }}
+          path: |
+            ${{ runner.temp }}/release
+            ${{ runner.temp }}/SHA256SUMS.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
+
+      - name: Create Draft Release
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          STAMP: ${{ steps.package.outputs.stamp }}
+        # Drafts are hidden from the public and create no tag until published by hand.
+        run: |
+          tag="main-$STAMP"
+          notes="$RUNNER_TEMP/release-notes.md"
+          {
+            echo "Built from $GITHUB_SHA."
+            echo
+            echo '`nodat` archives omit `data/assets-*.dat`; all other files are identical.'
+            echo
+            echo '```text'
+            cat "$RUNNER_TEMP/SHA256SUMS.txt"
+            echo '```'
+          } > "$notes"
+          gh release create "$tag" --draft --target "$GITHUB_SHA" \
+            --title "flutzPlayer $STAMP" --notes-file "$notes" "$RUNNER_TEMP"/release/*
+          echo "Draft release $tag created; publish it manually after review."

@@ -336,6 +336,47 @@ refresh the pinned tools, then rebuild and verify both launch modes.
 directories and synchronized guest build state while preserving the VM and
 caches.
 
+### GitHub release build
+
+Releases are built only on demand: run the **Release Build** workflow from the
+Actions tab (`workflow_dispatch`). Pushes do not trigger it. A run on `main`
+creates a **draft** release with all eight archives; it is hidden and has no
+tag until someone reviews and publishes it. A run on any other branch is build-only:
+it creates no release or tag, and its archives are kept as a workflow artifact
+for three days. Select **rebuild_dat** to ignore the DAT cache.
+
+All archives share one UTC `yyMMddHHmmss` stamp:
+
+| Archive | Contents |
+| --- | --- |
+| `flutzPlayer-Windows-x86_64[-nodat]-<stamp>.zip` | `flutzplayer.exe`, `data/`, `dat-packer/` (Windows drop layout) |
+| `flutzPlayer-Linux-x86_64[-nodat]-<stamp>.tar.gz` | `flutzPlayer/flutzplayer`, `data/`, `dat-packer/` |
+| `flutzPlayer-Linux-AppImage-x86_64[-nodat]-<stamp>.tar.gz` | `flutzPlayer/flutzPlayer-x86_64.AppImage`, `data/`, `dat-packer/` |
+| `flutzPlayer-Source-<stamp>.tar.gz` / `.zip` | Tracked source at the built commit |
+
+`nodat` archives are identical to their full counterparts except that
+`data/assets-*.dat` is omitted. The source archives contain no soundfonts,
+DATs, or vendored crates; bootstrap them as described in
+[Clone and bootstrap](#clone-and-bootstrap) and build DATs with
+`.\build-dat.ps1`.
+
+The workflow runs three jobs in parallel and then one assembly job:
+
+- **Windows**: the MSYS2/GNU build (`gh/Invoke-GhReleaseBuild.ps1 -NoDat`)
+  compiles the application and DAT packer once.
+- **Linux**: an `ubuntu:26.04` container installs the build subset of
+  `build/linux/provision/provision.sh`, uses the Rust toolchain and AppImage tool
+  pins in `build/linux/tool-versions.json`, and compiles once. It runs the same
+  static-linkage checks as the VM build, then builds the AppImage from that same
+  binary with `build-appimage.sh ci`.
+- **DAT**: packs the fileset once with `build/linux/scripts/build-dat.sh`. It is
+  cached by the manifest, soundfont source, and the packer's crates, so a hit
+  skips both the soundfont download and the pack.
+- **Assembly**: `gh/package-release.sh` stages each platform's binaries once.
+  It hard-links the shared DAT parts into the full variants and builds the
+  archives concurrently. Every archive is then checked against its staged tree,
+  modes, and checksums before any release is created.
+
 **NOTES:**
 
 - [build.ps1](build.ps1): workspace build + drop staging
